@@ -1,0 +1,23 @@
+# name: test/sql/lttb.test
+# description: test lttb extension
+# group: [sql]
+
+# Before we load the extension, this will fail
+statement error
+SELECT lttb('Sam');
+----
+Catalog Error: Scalar Function with name lttb does not exist!
+
+# Require statement will ensure this test is run with this extension loaded
+require lttb
+
+# Confirm the extension works
+query I
+SELECT lttb('Sam');
+----
+...........🦆 Sam
+
+query I
+SELECT lttb_openssl_version('Michael') ILIKE 'Lttb Michael, my linked OpenSSL version is OpenSSL%';
+----
+true
