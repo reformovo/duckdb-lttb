@@ -32,13 +32,20 @@ static bool IsValidPoint(double x, double y) {
 }
 
 static std::vector<LTTBPoint> Downsample(std::vector<LTTBPoint> &points, uint64_t buckets) {
-	std::stable_sort(points.begin(), points.end(), [](const LTTBPoint &lhs, const LTTBPoint &rhs) { return lhs.x < rhs.x; });
-
+	// No buckets requested — return empty immediately, no sorting needed.
 	if (buckets == 0) {
 		return {};
 	}
-	if (points.size() <= buckets) {
-		return points;
+
+	// Stable sort: preserve insertion order for equal x values.
+	std::stable_sort(points.begin(), points.end(),
+	                 [](const LTTBPoint &lhs, const LTTBPoint &rhs) { return lhs.x < rhs.x; });
+
+	const auto n = points.size();
+
+	// All points fit in the requested buckets — hand back the full sorted set.
+	if (n <= buckets) {
+		return std::move(points);
 	}
 	if (buckets == 1) {
 		return {points.front()};
@@ -51,7 +58,7 @@ static std::vector<LTTBPoint> Downsample(std::vector<LTTBPoint> &points, uint64_
 	sampled.reserve(NumericCast<idx_t>(buckets));
 	sampled.push_back(points.front());
 
-	const auto bucket_width = static_cast<double>(points.size() - 2) / static_cast<double>(buckets - 2);
+	const double bucket_width = static_cast<double>(n - 2) / static_cast<double>(buckets - 2);
 	idx_t selected_index = 0;
 
 	for (uint64_t bucket = 0; bucket < buckets - 2; bucket++) {
@@ -60,10 +67,10 @@ static std::vector<LTTBPoint> Downsample(std::vector<LTTBPoint> &points, uint64_
 		const auto after_next_bucket = static_cast<double>(bucket + 2);
 		const auto current_start = static_cast<idx_t>(std::floor(current_bucket * bucket_width)) + 1;
 		const auto current_end = MinValue<idx_t>(static_cast<idx_t>(std::floor(next_bucket * bucket_width)) + 1,
-		                                      points.size() - 1);
+		                                         n - 1);
 		const auto next_start = static_cast<idx_t>(std::floor(next_bucket * bucket_width)) + 1;
-		const auto next_end = MinValue<idx_t>(static_cast<idx_t>(std::floor(after_next_bucket * bucket_width)) + 1,
-		                                   points.size());
+		const auto next_end =
+		    MinValue<idx_t>(static_cast<idx_t>(std::floor(after_next_bucket * bucket_width)) + 1, n);
 
 		double avg_x = 0;
 		double avg_y = 0;
