@@ -4,20 +4,199 @@
 
 # Before we load the extension, this will fail
 statement error
-SELECT lttb('Sam');
+SELECT lttb(1.0, 1.0, 1);
 ----
 Catalog Error: Scalar Function with name lttb does not exist!
 
 # Require statement will ensure this test is run with this extension loaded
 require lttb
 
-# Confirm the extension works
+statement ok
+CREATE TABLE lttb_input(x DOUBLE, y DOUBLE);
+
+statement ok
+INSERT INTO lttb_input VALUES
+    (1.0, 10.0), (2.0, 20.0), (3.0, 15.0), (8.0, 60.0), (9.0, 55.0),
+    (10.0, 70.0), (4.0, 30.0), (5.0, 40.0), (6.0, 35.0), (7.0, 50.0);
+
+# Matches the ClickHouse largestTriangleThreeBuckets documentation example.
 query I
-SELECT lttb('Sam');
+SELECT list_transform(lttb(x, y, 4), lambda p: format('({}, {})', p.x::BIGINT, p.y::BIGINT)) FROM lttb_input;
 ----
-...........🦆 Sam
+['(1, 10)', '(3, 15)', '(9, 55)', '(10, 70)']
 
 query I
-SELECT lttb_openssl_version('Michael') ILIKE 'Lttb Michael, my linked OpenSSL version is OpenSSL%';
+SELECT list_transform(largestTriangleThreeBuckets(x, y, 4), lambda p: format('({}, {})', p.x::BIGINT, p.y::BIGINT)) FROM lttb_input;
 ----
-true
+['(1, 10)', '(3, 15)', '(9, 55)', '(10, 70)']
+
+query I
+SELECT list_transform(lttb(x, y, 0), lambda p: format('({}, {})', p.x::BIGINT, p.y::BIGINT)) FROM lttb_input;
+----
+[]
+
+query I
+SELECT list_transform(lttb(x, y, 1), lambda p: format('({}, {})', p.x::BIGINT, p.y::BIGINT)) FROM lttb_input;
+----
+['(1, 10)']
+
+query I
+SELECT list_transform(lttb(x, y, 2), lambda p: format('({}, {})', p.x::BIGINT, p.y::BIGINT)) FROM lttb_input;
+----
+['(1, 10)', '(10, 70)']
+
+query I
+SELECT list_transform(lttb(x, y, 20), lambda p: format('({}, {})', p.x::BIGINT, p.y::BIGINT)) FROM lttb_input;
+----
+['(1, 10)', '(2, 20)', '(3, 15)', '(4, 30)', '(5, 40)', '(6, 35)', '(7, 50)', '(8, 60)', '(9, 55)', '(10, 70)']
+
+statement ok
+CREATE TABLE lttb_invalid(x DOUBLE, y DOUBLE);
+
+statement ok
+INSERT INTO lttb_invalid VALUES (1.0, 10.0), (2.0, 'NaN'::DOUBLE), (NULL, 20.0), (3.0, 30.0);
+
+query I
+SELECT list_transform(lttb(x, y, 10), lambda p: format('({}, {})', p.x::BIGINT, p.y::BIGINT)) FROM lttb_invalid;
+----
+['(1, 10)', '(3, 30)']
+
+# Ported from ClickHouse tests/queries/0_stateless/03096_largest_triangle_3b_crash.sql.
+query I
+SELECT list_transform(largestTriangleThreeBuckets(1.0, 'NaN'::DOUBLE, 1), lambda p: format('({}, {})', p.x::BIGINT, p.y::BIGINT));
+----
+[]
+
+# Ported from ClickHouse tests/queries/0_stateless/02842_largestTriangleThreeBuckets_aggregate_function.sql.
+statement ok
+CREATE TABLE lttb_decimal_input(x DECIMAL(4, 2), y DECIMAL(4, 2));
+
+statement ok
+INSERT INTO lttb_decimal_input VALUES
+    (0.63, 0.25), (0.02, 0.16), (0.29, 0.16), (0.2, 0.24), (0.41, 0.63),
+    (0.06, 0.73), (0.36, 0.99), (0.57, 0.18), (0.98, 0.09), (0.73, 0.95),
+    (0.45, 0.86), (0.37, 0.86), (0.6, 0.64), (0.11, 0.31), (0.7, 0.25),
+    (0.85, 0.15), (0.68, 0.39), (0.9, 0.3), (0.25, 0.34), (0.09, 0.0),
+    (0.91, 0.62), (0.47, 0.06), (0.08, 0.88), (0.48, 0.57), (0.55, 0.75),
+    (0.19, 0.27), (0.87, 0.15), (0.15, 0.09), (0.77, 0.28), (0.5, 0.2),
+    (0.39, 0.86), (0.52, 0.11), (0.38, 0.75), (0.71, 0.44), (0.21, 0.46),
+    (0.88, 0.15), (0.83, 0.67), (0.23, 0.23);
+
+query I
+SELECT list_transform(lttb(x::DOUBLE, y::DOUBLE, 20), lambda p: format('({:.2f}, {:.2f})', p.x, p.y)) FROM lttb_decimal_input;
+----
+['(0.02, 0.16)', '(0.08, 0.88)', '(0.09, 0.00)', '(0.15, 0.09)', '(0.21, 0.46)', '(0.23, 0.23)', '(0.29, 0.16)', '(0.37, 0.86)', '(0.39, 0.86)', '(0.47, 0.06)', '(0.48, 0.57)', '(0.52, 0.11)', '(0.60, 0.64)', '(0.63, 0.25)', '(0.70, 0.25)', '(0.73, 0.95)', '(0.83, 0.67)', '(0.87, 0.15)', '(0.91, 0.62)', '(0.98, 0.09)']
+
+statement ok
+CREATE TABLE lttb_datetime_input(x TIMESTAMP, y DOUBLE);
+
+statement ok
+INSERT INTO lttb_datetime_input VALUES
+    ('2023-09-06 00:00:00', 14.217481939467213), ('2023-09-11 00:00:00', 30.096113766096455),
+    ('2023-01-31 00:00:00', 91.42364224984735), ('2023-12-14 00:00:00', 42.08543753438961),
+    ('2023-10-31 00:00:00', 29.93227107709394), ('2023-12-31 00:00:00', 98.52375935588333),
+    ('2023-07-07 00:00:00', 79.9367415060134), ('2023-08-02 00:00:00', 55.417182033825696),
+    ('2023-03-15 00:00:00', 98.77709508458238), ('2023-09-05 00:00:00', 2.832505232031368),
+    ('2023-06-05 00:00:00', 8.107958052612418), ('2023-02-08 00:00:00', 62.95788480328096),
+    ('2023-02-17 00:00:00', 76.80522155552535), ('2023-11-13 00:00:00', 24.927527306242993),
+    ('2023-02-03 00:00:00', 7.966981342350332), ('2023-05-31 00:00:00', 44.61922229800436),
+    ('2023-09-21 00:00:00', 65.86974701469791), ('2023-01-14 00:00:00', 35.96528042030847),
+    ('2023-02-19 00:00:00', 16.065599678978305), ('2023-05-24 00:00:00', 17.23630978966909),
+    ('2023-11-15 00:00:00', 15.544172190379879), ('2023-12-03 00:00:00', 13.738382187690856),
+    ('2023-10-09 00:00:00', 16.7137129521176), ('2023-11-19 00:00:00', 12.12866001303361),
+    ('2023-06-10 00:00:00', 95.15764263905534), ('2023-07-06 00:00:00', 18.87765798627088),
+    ('2023-03-13 00:00:00', 44.82941460384813), ('2023-01-29 00:00:00', 36.0214717111606),
+    ('2023-12-19 00:00:00', 90.30173319497655), ('2023-07-15 00:00:00', 12.67101467231364),
+    ('2023-07-06 00:00:00', 88.13662733228512), ('2023-05-10 00:00:00', 34.18711141027026),
+    ('2023-11-12 00:00:00', 75.58716684321973), ('2023-10-28 00:00:00', 35.79179186729331),
+    ('2023-11-14 00:00:00', 0.9318182359137728), ('2023-09-29 00:00:00', 80.05338096818797),
+    ('2023-09-13 00:00:00', 16.130217942056866), ('2023-07-28 00:00:00', 11.186638594914744),
+    ('2023-02-12 00:00:00', 69.43690757793445), ('2023-12-18 00:00:00', 12.832032764204616),
+    ('2023-05-21 00:00:00', 74.25002458036471), ('2023-04-03 00:00:00', 51.5662427420719),
+    ('2023-11-27 00:00:00', 96.44359131281784), ('2023-03-29 00:00:00', 33.018594418113324),
+    ('2023-02-07 00:00:00', 84.58945099939815), ('2023-11-16 00:00:00', 40.61531555527268),
+    ('2023-04-21 00:00:00', 60.0545791577218), ('2023-01-31 00:00:00', 87.23185155362057),
+    ('2023-05-19 00:00:00', 77.4095289464808), ('2023-08-26 00:00:00', 18.700816570182067);
+
+query I
+SELECT list_transform(lttb(epoch(x)::DOUBLE, y, 5), lambda p: format('({}, {:.6f})', strftime(to_timestamp(p.x), '%Y-%m-%d'), p.y)) FROM lttb_datetime_input;
+----
+['(2023-01-14, 35.965280)', '(2023-03-15, 98.777095)', '(2023-06-05, 8.107958)', '(2023-12-18, 12.832033)', '(2023-12-31, 98.523759)']
+
+# Ported from ClickHouse PR #57003 bucket-size regression inside 02842_largestTriangleThreeBuckets_aggregate_function.sql.
+query III
+WITH sampled AS (
+    SELECT row_number() OVER () AS rn, unnest(lttb(i::DOUBLE + 1, (i + 1) % 1000, 1000)) AS point
+    FROM range(9999) AS t(i)
+), points AS (
+    SELECT rn, point.x::BIGINT AS point_x, point.y::BIGINT AS point_y FROM sampled
+)
+SELECT format('({}, {})', point_x, point_y), point_x, point_x - lag(point_x) OVER (ORDER BY rn)
+FROM points
+ORDER BY rn
+LIMIT 10 OFFSET 990;
+----
+(9908, 908)	9908	10
+(9918, 918)	9918	10
+(9928, 928)	9928	10
+(9938, 938)	9938	10
+(9948, 948)	9948	10
+(9958, 958)	9958	10
+(9968, 968)	9968	10
+(9978, 978)	9978	10
+(9988, 988)	9988	10
+(9999, 999)	9999	11
+
+query II rowsort
+SELECT g, list_transform(lttb(x, y, 2), lambda p: format('({}, {})', p.x::BIGINT, p.y::BIGINT))
+FROM (VALUES (1, 2.0, 20.0), (1, 1.0, 10.0), (2, 4.0, 40.0), (2, 3.0, 30.0)) AS t(g, x, y)
+GROUP BY g;
+----
+1	['(1, 10)', '(2, 20)']
+2	['(3, 30)', '(4, 40)']
+
+statement error
+SELECT lttb(x, y, CASE WHEN x = 1 THEN 2 ELSE 3 END::BIGINT) FROM lttb_input;
+----
+lttb bucket count must be constant within each aggregate group
+
+# Duplicate x stability: stable_sort preserves input order for equal x values.
+statement ok
+CREATE TABLE lttb_dup_x (x DOUBLE, y DOUBLE);
+
+statement ok
+INSERT INTO lttb_dup_x VALUES (2.0, 40.0), (1.0, 10.0), (1.0, 20.0), (2.0, 30.0);
+
+query I
+SELECT list_transform(lttb(x, y, 4), lambda p: format('({}, {})', p.x::BIGINT, p.y::BIGINT)) FROM lttb_dup_x;
+----
+['(1, 10)', '(1, 20)', '(2, 40)', '(2, 30)']
+
+statement ok
+DROP TABLE lttb_dup_x;
+
+# All-invalid input tests.
+query I
+SELECT list_transform(lttb('NaN'::DOUBLE, 1.0, 1), lambda p: format('({}, {})', p.x::BIGINT, p.y::BIGINT));
+----
+[]
+
+query I
+SELECT list_transform(lttb(NULL, 1.0, 1), lambda p: format('({}, {})', p.x::BIGINT, p.y::BIGINT));
+----
+[]
+
+query I
+SELECT list_transform(lttb(1.0, NULL, 1), lambda p: format('({}, {})', p.x::BIGINT, p.y::BIGINT));
+----
+[]
+
+query I
+SELECT list_transform(lttb(NULL::DOUBLE, NULL::DOUBLE, 1), lambda p: format('({}, {})', p.x::BIGINT, p.y::BIGINT));
+----
+[]
+
+statement error
+SELECT lttb(1.0, 1.0, -1);
+----
+lttb bucket count must be non-negative
