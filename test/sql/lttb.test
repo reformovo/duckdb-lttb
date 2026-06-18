@@ -297,6 +297,19 @@ SELECT lttb('hello'::VARCHAR, 1.0, 1);
 ----
 lttb requires numeric or temporal x/y types
 
+# Sorted-input fast path: lttb_sorted skips stable_sort when caller guarantees
+# pre-sorted input. On already-sorted data, output matches lttb.
+query I
+SELECT list_transform(lttb_sorted(x, y, 4), lambda p: format('({}, {})', p.x::BIGINT, p.y::BIGINT)) FROM (VALUES (1.0, 10.0), (2.0, 20.0), (3.0, 15.0), (4.0, 30.0), (5.0, 40.0), (6.0, 35.0), (7.0, 50.0), (8.0, 60.0), (9.0, 55.0), (10.0, 70.0)) AS t(x, y);
+----
+['(1, 10)', '(3, 15)', '(9, 55)', '(10, 70)']
+
+# lttb_sorted with typed input (TIMESTAMP).
+query I
+SELECT list_transform(lttb_sorted(x, y, 2), lambda p: format('({}, {})', strftime(p.x, '%Y-%m-%d'), p.y)) FROM (VALUES (TIMESTAMP '2023-01-01 00:00:00', 10.0), (TIMESTAMP '2023-06-01 00:00:00', 20.0)) AS t(x, y);
+----
+['(2023-01-01, 10.0)', '(2023-06-01, 20.0)']
+
 statement ok
 DROP TABLE lttb_ts_input;
 

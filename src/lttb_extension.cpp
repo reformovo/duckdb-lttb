@@ -32,6 +32,23 @@ struct LTTBState {
 	bool has_buckets = false;
 };
 
+// Bind data carrying whether the caller guarantees pre-sorted input (lttb_sorted).
+struct LTTBFunctionData : public FunctionData {
+	explicit LTTBFunctionData(bool sorted_p) : sorted(sorted_p) {
+	}
+
+	bool sorted;
+
+	unique_ptr<FunctionData> Copy() const override {
+		return make_uniq<LTTBFunctionData>(*this);
+	}
+
+	bool Equals(const FunctionData &other_p) const override {
+		auto &other = other_p.Cast<LTTBFunctionData>();
+		return sorted == other.sorted;
+	}
+};
+
 static bool IsValidPoint(double x, double y) {
 	return !std::isnan(x) && !std::isnan(y);
 }
@@ -244,17 +261,19 @@ static bool IsLTTBSupportedType(const LogicalType &type) {
 	}
 }
 
-static std::vector<LTTBPoint> Downsample(std::vector<LTTBPoint> &points, uint64_t buckets) {
+static std::vector<LTTBPoint> Downsample(std::vector<LTTBPoint> &points, uint64_t buckets, bool skip_sort = false) {
 	// No buckets requested — return empty immediately, no sorting needed.
 	if (buckets == 0) {
 		return {};
 	}
 
-	// Stable sort: preserve insertion order for equal x values.
-	// Epoch-double conversion is monotonic for all supported types, so sorting
-	// on doubles preserves correct temporal ordering.
-	std::stable_sort(points.begin(), points.end(),
-	                 [](const LTTBPoint &lhs, const LTTBPoint &rhs) { return lhs.x < rhs.x; });
+	if (!skip_sort) {
+		// Stable sort: preserve insertion order for equal x values.
+		// Epoch-double conversion is monotonic for all supported types, so sorting
+		// on doubles preserves correct temporal ordering.
+		std::stable_sort(points.begin(), points.end(),
+		                 [](const LTTBPoint &lhs, const LTTBPoint &rhs) { return lhs.x < rhs.x; });
+	}
 
 	const auto n = points.size();
 
@@ -433,7 +452,8 @@ static void LTTBCombine(Vector &state_vector, Vector &combined, AggregateInputDa
 	}
 }
 
-static void LTTBFinalize(Vector &state_vector, AggregateInputData &, Vector &result, idx_t count, idx_t offset) {
+static void LTTBFinalize(Vector &state_vector, AggregateInputData &input_data, Vector &result, idx_t count,
+                         idx_t offset) {
 	UnifiedVectorFormat state_data;
 	state_vector.ToUnifiedFormat(count, state_data);
 	auto states = UnifiedVectorFormat::GetData<LTTBState *>(state_data);
@@ -445,10 +465,13 @@ static void LTTBFinalize(Vector &state_vector, AggregateInputData &, Vector &res
 	const auto &x_type = x_child.GetType();
 	const auto &y_type = y_child.GetType();
 
+	const bool skip_sort =
+	    input_data.bind_data && input_data.bind_data->Cast<LTTBFunctionData>().sorted;
+
 	idx_t total_size = ListVector::GetListSize(result);
 	for (idx_t row = 0; row < count; row++) {
 		auto &state = *states[state_data.sel->get_index(row)];
-		auto sampled = state.has_buckets && state.points ? Downsample(*state.points, state.buckets) : std::vector<LTTBPoint>();
+		auto sampled = state.has_buckets && state.points ? Downsample(*state.points, state.buckets, skip_sort) : std::vector<LTTBPoint>();
 		ListVector::Reserve(result, total_size + sampled.size());
 
 		auto &entry = list_entries[row + offset];
@@ -490,8 +513,8 @@ static AggregateFunction GetLTTBConcreteFunction(const string &name, const Logic
 	                         FunctionNullHandling::SPECIAL_HANDLING, nullptr, nullptr, LTTBDestroy);
 }
 
-static unique_ptr<FunctionData> LTTBBindFunction(ClientContext &, AggregateFunction &function,
-                                                 vector<unique_ptr<Expression>> &arguments) {
+static unique_ptr<FunctionData> LTTBBindFunctionImpl(ClientContext &, AggregateFunction &function,
+                                                    vector<unique_ptr<Expression>> &arguments, bool sorted) {
 	for (auto &argument : arguments) {
 		if (argument->return_type.id() == LogicalTypeId::UNKNOWN) {
 			throw ParameterNotResolvedException();
@@ -509,7 +532,17 @@ static unique_ptr<FunctionData> LTTBBindFunction(ClientContext &, AggregateFunct
 	}
 
 	function = GetLTTBConcreteFunction(function.name, x_resolved, y_resolved);
-	return nullptr;
+	return make_uniq<LTTBFunctionData>(sorted);
+}
+
+static unique_ptr<FunctionData> LTTBBindFunction(ClientContext &context, AggregateFunction &function,
+                                                 vector<unique_ptr<Expression>> &arguments) {
+	return LTTBBindFunctionImpl(context, function, arguments, false);
+}
+
+static unique_ptr<FunctionData> LTTBSortedBindFunction(ClientContext &context, AggregateFunction &function,
+                                                       vector<unique_ptr<Expression>> &arguments) {
+	return LTTBBindFunctionImpl(context, function, arguments, true);
 }
 
 static AggregateFunction GetLTTBFunction(const string &name) {
@@ -517,11 +550,18 @@ static AggregateFunction GetLTTBFunction(const string &name) {
 	                         nullptr, nullptr, nullptr, nullptr, nullptr, LTTBBindFunction, nullptr);
 }
 
+static AggregateFunction GetLTTBSortedFunction(const string &name) {
+	return AggregateFunction(name, {LogicalType::ANY, LogicalType::ANY, LogicalType::BIGINT}, LogicalType::ANY, nullptr,
+	                         nullptr, nullptr, nullptr, nullptr, nullptr, LTTBSortedBindFunction, nullptr);
+}
+
 } // namespace
 
 static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(GetLTTBFunction("lttb"));
 	loader.RegisterFunction(GetLTTBFunction("largestTriangleThreeBuckets"));
+	// Sorted-input fast path: caller guarantees input is ordered by x.
+	loader.RegisterFunction(GetLTTBSortedFunction("lttb_sorted"));
 }
 
 void LttbExtension::Load(ExtensionLoader &loader) {

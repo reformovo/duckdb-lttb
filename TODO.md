@@ -58,11 +58,14 @@ operate on doubles internally; type conversion happens at I/O boundaries.
 - [ ] Add memory guard controls
   - Keep the current hard max point guard (`MAX_LTTB_POINTS`).
   - Consider user-configurable max points per group for large production queries.
+  - Deferred: requires a configuration mechanism (PRAGMA setting or FunctionData)
+    to pass the limit at runtime. The current hard guard of `1 << 30` is very
+    generous. Revisit when production users report needing a lower cap.
 
-- [ ] Add sorted-input fast path
-  - Provide a separate function such as `lttb_sorted(x, y, n)`.
-  - Skip `stable_sort` (`src/lttb_extension.cpp:41`) when caller guarantees input
-    is already ordered by `x`.
+- [x] Add sorted-input fast path
+  - Added `lttb_sorted(x, y, n)` function that skips `stable_sort` when the
+    caller guarantees input is already ordered by `x`. Uses `LTTBFunctionData`
+    bind data to carry the `sorted` flag to finalize.
 
 - [ ] Evaluate index-sort strategy
   - ClickHouse sorts an index array (`PODArray<UInt32>`), not the points.
