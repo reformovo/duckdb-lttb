@@ -3,7 +3,6 @@
 #include "lttb_extension.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/date.hpp"
-#include "duckdb/common/types/decimal.hpp"
 #include "duckdb/common/types/hugeint.hpp"
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/common/types/uhugeint.hpp"
@@ -12,6 +11,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -439,8 +439,8 @@ static void LTTBUpdate(Vector inputs[], AggregateInputData &, idx_t input_count,
 			state.points->reserve(256);
 		}
 		if (state.points->size() >= MAX_LTTB_POINTS) {
-			throw InvalidInputException("lttb aggregate state exceeded maximum point count of %llu",
-			                            static_cast<unsigned long long>(MAX_LTTB_POINTS));
+			throw InvalidInputException("lttb aggregate state exceeded maximum point count of " +
+			                            std::to_string(MAX_LTTB_POINTS));
 		}
 		state.points->push_back({x, y});
 	}
@@ -478,8 +478,8 @@ static void LTTBCombine(Vector &state_vector, Vector &combined, AggregateInputDa
 			continue;
 		}
 		if (target.points->size() + source.points->size() > MAX_LTTB_POINTS) {
-			throw InvalidInputException("lttb aggregate state exceeded maximum point count of %llu",
-			                            static_cast<unsigned long long>(MAX_LTTB_POINTS));
+			throw InvalidInputException("lttb aggregate state exceeded maximum point count of " +
+			                            std::to_string(MAX_LTTB_POINTS));
 		}
 		// Reserve before insert to avoid geometric reallocation per combine.
 		target.points->reserve(target.points->size() + source.points->size());
