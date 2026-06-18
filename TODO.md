@@ -82,25 +82,13 @@ operate on doubles internally; type conversion happens at I/O boundaries.
 
 ## P2: API Extensions
 
-- [ ] Document ClickHouse syntax difference
-  - DuckDB uses `lttb(x, y, n)`.
-  - ClickHouse uses `lttb(n)(x, y)` / `largestTriangleThreeBuckets(n)(x, y)`
-    (parametric aggregate; `n` is a UInt64 param, not a runtime arg).
+- [x] Document ClickHouse syntax difference
+  - Documented in README.md: DuckDB uses `lttb(x, y, n)` (regular aggregate);
+    ClickHouse uses `lttb(n)(x, y)` (parametric aggregate).
 
-- [ ] Document DuckDB behavioral advantages (vs ClickHouse and Python)
-  - Stable sort: DuckDB uses `stable_sort`, so duplicate `x` preserves insertion
-    order; ClickHouse uses unstable `::sort` (unspecified duplicate order);
-    Python `lttb` rejects duplicate `x` entirely.
-  - Internal sort: DuckDB sorts internally; Python `lttb` requires strictly
-    increasing pre-sorted input and rejects unsorted/duplicate data.
-  - Graceful `n < 3`: DuckDB handles `n = 0/1/2` with defined semantics; Python
-    `lttb` raises `ValueError` for `n_out < 3`.
-  - Empty next-bucket guard: DuckDB falls back to the last point when the next
-    bucket is empty (`src/lttb_extension.cpp:85-88`); ClickHouse source lacks
-    this guard (would divide by zero — PR #57003 avoids the split in practice).
-  - NULL handling: DuckDB skips NULL rows via the validity mask; ClickHouse has
-    no explicit NULL handling in this function.
-  - NaN: DuckDB/ClickHouse skip NaN rows; Python `lttb` rejects via validator.
+- [x] Document DuckDB behavioral advantages (vs ClickHouse and Python)
+  - Documented in README.md: stable sort, internal sort, graceful n<3,
+    empty-next-bucket guard, NULL handling, NaN/Inf behavior.
 
 - [ ] Consider selected-index output
   - Add a function such as `lttb_indices(x, y, n)`.
@@ -144,11 +132,10 @@ operate on doubles internally; type conversion happens at I/O boundaries.
     because the triangle area becomes Inf. SQLLogicTests added for +Inf and
     -Inf x input to pin the behavior.
 
-- [ ] Document the implicit-cast input contract
-  - `LTTBBindFunction` (`src/lttb_extension.cpp:263-273`) resolves `ANY, ANY`
-    to `DOUBLE, DOUBLE`. Non-castable types (e.g. `VARCHAR`) fail at the
-    implicit-cast stage with a potentially confusing error. Document the
-    accepted input contract.
+- [x] Document the implicit-cast input contract
+  - Documented in README.md "Supported Input Types" section: the bind function
+    validates x/y against the supported type set and rejects unsupported types
+    (e.g. VARCHAR) with a clear error message.
 
 ## P3: Tests, Benchmarks, and Docs
 
@@ -164,11 +151,13 @@ operate on doubles internally; type conversion happens at I/O boundaries.
   - Reference bar: `plotly-resampler` uses `tsdownsample` Rust bindings with
     parallelization.
 
-- [ ] Expand documentation
-  - Explain memory model: exact LTTB is not O(1) memory.
-  - Explain ClickHouse parity and known differences (see P2 "Document DuckDB
-    behavioral advantages").
-  - Include DuckLake scalar-metric example queries.
+- [x] Expand documentation
+  - README.md now documents: supported input types, ClickHouse syntax
+    difference, DuckDB behavioral advantages, function reference table.
+  - Memory model: exact LTTB is not O(1) memory — documented in the behavioral
+    advantages section (state accumulates all valid points per group).
+  - DuckLake scalar-metric example queries: deferred (general DuckDB guidance,
+    not extension-specific).
 
 ## Items Dropped or Parked
 
