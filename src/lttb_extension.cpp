@@ -19,7 +19,7 @@ namespace duckdb {
 
 namespace {
 
-constexpr idx_t MAX_LTTB_POINTS = idx_t(1) << 30;
+constexpr idx_t MAX_LTTB_POINTS = 1ULL << 30;
 
 struct LTTBPoint {
 	double x;
@@ -261,6 +261,10 @@ static bool IsLTTBSupportedType(const LogicalType &type) {
 	}
 }
 
+// Downsample the given points to `buckets` using the LTTB algorithm.
+// NOTE: This function mutates `points` in place (sorts it) and may std::move
+// it entirely when n <= buckets. This is safe because LTTBFinalize is the
+// terminal consumer of the state vector.
 static std::vector<LTTBPoint> Downsample(std::vector<LTTBPoint> &points, uint64_t buckets, bool skip_sort = false) {
 	// No buckets requested — return empty immediately, no sorting needed.
 	if (buckets == 0) {
@@ -406,7 +410,8 @@ static void LTTBUpdate(Vector inputs[], AggregateInputData &, idx_t input_count,
 			state.points->reserve(256);
 		}
 		if (state.points->size() >= MAX_LTTB_POINTS) {
-			throw InvalidInputException("lttb aggregate state exceeded maximum point count of %llu", MAX_LTTB_POINTS);
+			throw InvalidInputException("lttb aggregate state exceeded maximum point count of %llu",
+			                            static_cast<unsigned long long>(MAX_LTTB_POINTS));
 		}
 		state.points->push_back({x, y});
 	}
@@ -444,7 +449,8 @@ static void LTTBCombine(Vector &state_vector, Vector &combined, AggregateInputDa
 			continue;
 		}
 		if (target.points->size() + source.points->size() > MAX_LTTB_POINTS) {
-			throw InvalidInputException("lttb aggregate state exceeded maximum point count of %llu", MAX_LTTB_POINTS);
+			throw InvalidInputException("lttb aggregate state exceeded maximum point count of %llu",
+			                            static_cast<unsigned long long>(MAX_LTTB_POINTS));
 		}
 		// Reserve before insert to avoid geometric reallocation per combine.
 		target.points->reserve(target.points->size() + source.points->size());

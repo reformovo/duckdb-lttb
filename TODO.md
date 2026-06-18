@@ -67,10 +67,12 @@ operate on doubles internally; type conversion happens at I/O boundaries.
     caller guarantees input is already ordered by `x`. Uses `LTTBFunctionData`
     bind data to carry the `sorted` flag to finalize.
 
-- [ ] Evaluate index-sort strategy
+- [x] Evaluate index-sort strategy
   - ClickHouse sorts an index array (`PODArray<UInt32>`), not the points.
   - Current `LTTBPoint` is small (16 bytes), so sorting points is likely fine.
-  - Revisit if state stores wider records or selected-index output is added.
+  - Decision: keep point-sort for now. The 16-byte struct is cache-friendly and
+    the sort is not the bottleneck for typical LTTB workloads. Revisit only if
+    state stores wider records or selected-index output is added.
 
 ### Algorithm Correctness
 
@@ -121,20 +123,20 @@ operate on doubles internally; type conversion happens at I/O boundaries.
   - Fixed in the P0 commit: `next_count` moved inside the `if` branch, dead
     `idx_t(1)` fallback removed.
 
-- [ ] Fix `%llu` portability for `idx_t`
-  - `src/lttb_extension.cpp:170, 203`: `idx_t` is `uint64_t`; `%llu` is wrong on
-    LP64 Linux (`unsigned long`). Use `PRIu64` from `<cinttypes>` or DuckDB's
-    type-safe formatter.
+- [x] Fix `%llu` portability for `idx_t`
+  - Fixed: `MAX_LTTB_POINTS` error messages now use
+    `static_cast<unsigned long long>(MAX_LTTB_POINTS)` for portable `%llu`
+    formatting. `MAX_LTTB_POINTS` changed to `1ULL << 30` to match ClickHouse
+    verbatim.
 
-- [ ] Document `Downsample` ownership transfer
-  - `src/lttb_extension.cpp:34, 48`: `Downsample` takes the state vector by
-    reference and `std::move`s it when `n <= buckets`, emptying the state. This
-    is correct only because `LTTBFinalize` is terminal. Add a comment or
-    refactor to take by value to make ownership transfer explicit.
+- [x] Document `Downsample` ownership transfer
+  - Added a comment documenting that `Downsample` mutates the input vector
+    (sorts it) and may `std::move` it when `n <= buckets`, which is safe because
+    `LTTBFinalize` is the terminal consumer.
 
-- [ ] Align `MAX_LTTB_POINTS` constant with ClickHouse
-  - `src/lttb_extension.cpp:17`: use `1ULL << 30` to match ClickHouse's
-    `MAX_ARRAY_SIZE` verbatim (currently `idx_t(1) << 30`).
+- [x] Align `MAX_LTTB_POINTS` constant with ClickHouse
+  - Changed from `idx_t(1) << 30` to `1ULL << 30` to match ClickHouse's
+    `MAX_ARRAY_SIZE` verbatim.
 
 - [ ] Pin Inf handling behavior
   - All three implementations (DuckDB, ClickHouse, Python `lttb`) filter NaN but
