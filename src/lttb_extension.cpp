@@ -247,14 +247,34 @@ static void LTTBDestroy(Vector &state_vector, AggregateInputData &, idx_t count)
 	}
 }
 
-static AggregateFunction GetLTTBFunction(const string &name) {
+static LogicalType LTTBReturnType() {
 	child_list_t<LogicalType> struct_children;
 	struct_children.emplace_back("x", LogicalType::DOUBLE);
 	struct_children.emplace_back("y", LogicalType::DOUBLE);
-	auto return_type = LogicalType::LIST(LogicalType::STRUCT(std::move(struct_children)));
-	return AggregateFunction(name, {LogicalType::DOUBLE, LogicalType::DOUBLE, LogicalType::BIGINT}, return_type,
+	return LogicalType::LIST(LogicalType::STRUCT(std::move(struct_children)));
+}
+
+static AggregateFunction GetLTTBConcreteFunction(const string &name) {
+	return AggregateFunction(name, {LogicalType::DOUBLE, LogicalType::DOUBLE, LogicalType::BIGINT}, LTTBReturnType(),
 	                         LTTBStateSize, LTTBInitialize, LTTBUpdate, LTTBCombine, LTTBFinalize,
 	                         FunctionNullHandling::SPECIAL_HANDLING, nullptr, nullptr, LTTBDestroy);
+}
+
+static unique_ptr<FunctionData> LTTBBindFunction(ClientContext &, AggregateFunction &function,
+                                                 vector<unique_ptr<Expression>> &arguments) {
+	for (auto &argument : arguments) {
+		if (argument->return_type.id() == LogicalTypeId::UNKNOWN) {
+			throw ParameterNotResolvedException();
+		}
+	}
+
+	function = GetLTTBConcreteFunction(function.name);
+	return nullptr;
+}
+
+static AggregateFunction GetLTTBFunction(const string &name) {
+	return AggregateFunction(name, {LogicalType::ANY, LogicalType::ANY, LogicalType::BIGINT}, LTTBReturnType(), nullptr,
+	                         nullptr, nullptr, nullptr, nullptr, nullptr, LTTBBindFunction, nullptr);
 }
 
 } // namespace
