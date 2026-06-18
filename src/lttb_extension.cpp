@@ -265,7 +265,10 @@ static bool IsLTTBSupportedType(const LogicalType &type) {
 // NOTE: This function mutates `points` in place (sorts it) and may std::move
 // it entirely when n <= buckets. This is safe because LTTBFinalize is the
 // terminal consumer of the state vector.
-static std::vector<LTTBPoint> Downsample(std::vector<LTTBPoint> &points, uint64_t buckets, bool skip_sort = false) {
+// If `out_indices` is non-null, fills it with the 0-based sorted-position
+// indices of the selected points (for lttb_indices output).
+static std::vector<LTTBPoint> Downsample(std::vector<LTTBPoint> &points, uint64_t buckets, bool skip_sort = false,
+                                        std::vector<idx_t> *out_indices = nullptr) {
 	// No buckets requested — return empty immediately, no sorting needed.
 	if (buckets == 0) {
 		return {};
@@ -283,18 +286,38 @@ static std::vector<LTTBPoint> Downsample(std::vector<LTTBPoint> &points, uint64_
 
 	// All points fit in the requested buckets — hand back the full sorted set.
 	if (n <= buckets) {
+		if (out_indices) {
+			out_indices->resize(n);
+			for (idx_t i = 0; i < n; i++) {
+				(*out_indices)[i] = i;
+			}
+		}
 		return std::move(points);
 	}
 	if (buckets == 1) {
+		if (out_indices) {
+			out_indices->clear();
+			out_indices->push_back(0);
+		}
 		return {points.front()};
 	}
 	if (buckets == 2) {
+		if (out_indices) {
+			out_indices->clear();
+			out_indices->push_back(0);
+			out_indices->push_back(n - 1);
+		}
 		return {points.front(), points.back()};
 	}
 
 	std::vector<LTTBPoint> sampled;
 	sampled.reserve(NumericCast<idx_t>(buckets));
 	sampled.push_back(points.front());
+	if (out_indices) {
+		out_indices->clear();
+		out_indices->reserve(NumericCast<idx_t>(buckets));
+		out_indices->push_back(0);
+	}
 
 	const double bucket_width = static_cast<double>(n - 2) / static_cast<double>(buckets - 2);
 	idx_t selected_index = 0;
@@ -339,10 +362,16 @@ static std::vector<LTTBPoint> Downsample(std::vector<LTTBPoint> &points, uint64_
 		}
 
 		sampled.push_back(points[max_area_index]);
+		if (out_indices) {
+			out_indices->push_back(max_area_index);
+		}
 		selected_index = max_area_index;
 	}
 
 	sampled.push_back(points.back());
+	if (out_indices) {
+		out_indices->push_back(n - 1);
+	}
 	return sampled;
 }
 
@@ -492,6 +521,38 @@ static void LTTBFinalize(Vector &state_vector, AggregateInputData &input_data, V
 	ListVector::SetListSize(result, total_size);
 }
 
+// Finalize for lttb_indices: returns BIGINT[] of selected sorted-position indices.
+static void LTTBIndicesFinalize(Vector &state_vector, AggregateInputData &input_data, Vector &result, idx_t count,
+                                idx_t offset) {
+	UnifiedVectorFormat state_data;
+	state_vector.ToUnifiedFormat(count, state_data);
+	auto states = UnifiedVectorFormat::GetData<LTTBState *>(state_data);
+	auto list_entries = FlatVector::GetData<list_entry_t>(result);
+
+	const bool skip_sort =
+	    input_data.bind_data && input_data.bind_data->Cast<LTTBFunctionData>().sorted;
+
+	idx_t total_size = ListVector::GetListSize(result);
+	for (idx_t row = 0; row < count; row++) {
+		auto &state = *states[state_data.sel->get_index(row)];
+		std::vector<idx_t> indices;
+		if (state.has_buckets && state.points) {
+			Downsample(*state.points, state.buckets, skip_sort, &indices);
+		}
+		ListVector::Reserve(result, total_size + indices.size());
+		auto index_output = FlatVector::GetData<int64_t>(ListVector::GetEntry(result));
+
+		auto &entry = list_entries[row + offset];
+		entry.offset = total_size;
+		entry.length = indices.size();
+		for (idx_t i = 0; i < indices.size(); i++) {
+			index_output[total_size + i] = static_cast<int64_t>(indices[i]);
+		}
+		total_size += indices.size();
+	}
+	ListVector::SetListSize(result, total_size);
+}
+
 static void LTTBDestroy(Vector &state_vector, AggregateInputData &, idx_t count) {
 	UnifiedVectorFormat state_data;
 	state_vector.ToUnifiedFormat(count, state_data);
@@ -519,8 +580,18 @@ static AggregateFunction GetLTTBConcreteFunction(const string &name, const Logic
 	                         FunctionNullHandling::SPECIAL_HANDLING, nullptr, nullptr, LTTBDestroy);
 }
 
+// Concrete function for lttb_indices: same state/update/combine/destroy, but
+// different finalize (writes BIGINT[] of selected sorted-position indices).
+static AggregateFunction GetLTTBIndicesConcreteFunction(const string &name, const LogicalType &x_type,
+                                                        const LogicalType &y_type) {
+	return AggregateFunction(name, {x_type, y_type, LogicalType::BIGINT}, LogicalType::LIST(LogicalType::BIGINT),
+	                         LTTBStateSize, LTTBInitialize, LTTBUpdate, LTTBCombine, LTTBIndicesFinalize,
+	                         FunctionNullHandling::SPECIAL_HANDLING, nullptr, nullptr, LTTBDestroy);
+}
+
 static unique_ptr<FunctionData> LTTBBindFunctionImpl(ClientContext &, AggregateFunction &function,
-                                                    vector<unique_ptr<Expression>> &arguments, bool sorted) {
+                                                    vector<unique_ptr<Expression>> &arguments, bool sorted,
+                                                    bool indices) {
 	for (auto &argument : arguments) {
 		if (argument->return_type.id() == LogicalTypeId::UNKNOWN) {
 			throw ParameterNotResolvedException();
@@ -537,18 +608,27 @@ static unique_ptr<FunctionData> LTTBBindFunctionImpl(ClientContext &, AggregateF
 		    "lttb requires numeric or temporal x/y types; got x=%s, y=%s", x_type.ToString(), y_type.ToString());
 	}
 
-	function = GetLTTBConcreteFunction(function.name, x_resolved, y_resolved);
+	if (indices) {
+		function = GetLTTBIndicesConcreteFunction(function.name, x_resolved, y_resolved);
+	} else {
+		function = GetLTTBConcreteFunction(function.name, x_resolved, y_resolved);
+	}
 	return make_uniq<LTTBFunctionData>(sorted);
 }
 
 static unique_ptr<FunctionData> LTTBBindFunction(ClientContext &context, AggregateFunction &function,
                                                  vector<unique_ptr<Expression>> &arguments) {
-	return LTTBBindFunctionImpl(context, function, arguments, false);
+	return LTTBBindFunctionImpl(context, function, arguments, false, false);
 }
 
 static unique_ptr<FunctionData> LTTBSortedBindFunction(ClientContext &context, AggregateFunction &function,
                                                        vector<unique_ptr<Expression>> &arguments) {
-	return LTTBBindFunctionImpl(context, function, arguments, true);
+	return LTTBBindFunctionImpl(context, function, arguments, true, false);
+}
+
+static unique_ptr<FunctionData> LTTBIndicesBindFunction(ClientContext &context, AggregateFunction &function,
+                                                        vector<unique_ptr<Expression>> &arguments) {
+	return LTTBBindFunctionImpl(context, function, arguments, false, true);
 }
 
 static AggregateFunction GetLTTBFunction(const string &name) {
@@ -561,6 +641,11 @@ static AggregateFunction GetLTTBSortedFunction(const string &name) {
 	                         nullptr, nullptr, nullptr, nullptr, nullptr, LTTBSortedBindFunction, nullptr);
 }
 
+static AggregateFunction GetLTTBIndicesFunction(const string &name) {
+	return AggregateFunction(name, {LogicalType::ANY, LogicalType::ANY, LogicalType::BIGINT}, LogicalType::ANY, nullptr,
+	                         nullptr, nullptr, nullptr, nullptr, nullptr, LTTBIndicesBindFunction, nullptr);
+}
+
 } // namespace
 
 static void LoadInternal(ExtensionLoader &loader) {
@@ -568,6 +653,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(GetLTTBFunction("largestTriangleThreeBuckets"));
 	// Sorted-input fast path: caller guarantees input is ordered by x.
 	loader.RegisterFunction(GetLTTBSortedFunction("lttb_sorted"));
+	// Indices output: returns BIGINT[] of selected sorted-position indices.
+	loader.RegisterFunction(GetLTTBIndicesFunction("lttb_indices"));
 }
 
 void LttbExtension::Load(ExtensionLoader &loader) {

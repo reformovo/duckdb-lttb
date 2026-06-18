@@ -6,6 +6,7 @@ DuckDB extension implementing Largest-Triangle-Three-Buckets downsampling as agg
 lttb(x, y, n)
 largestTriangleThreeBuckets(x, y, n)
 lttb_sorted(x, y, n)
+lttb_indices(x, y, n)
 ```
 
 The behavior is modeled after ClickHouse `largestTriangleThreeBuckets` / `lttb`. See `docs/reference/clickhouse-lttb.md` for the archived reference behavior and test sources.
@@ -17,6 +18,7 @@ The behavior is modeled after ClickHouse `largestTriangleThreeBuckets` / `lttb`.
 | `lttb(x, y, n)` | Downsample to `n` points. Sorts input by `x` before sampling. |
 | `largestTriangleThreeBuckets(x, y, n)` | Alias for `lttb`. |
 | `lttb_sorted(x, y, n)` | Same as `lttb` but skips the sort. Caller must guarantee input is already ordered by `x`. |
+| `lttb_indices(x, y, n)` | Same selection as `lttb` but returns `BIGINT[]` of selected sorted-position indices instead of points. |
 
 ### Supported Input Types
 

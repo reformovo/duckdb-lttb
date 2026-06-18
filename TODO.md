@@ -90,12 +90,10 @@ operate on doubles internally; type conversion happens at I/O boundaries.
   - Documented in README.md: stable sort, internal sort, graceful n<3,
     empty-next-bucket guard, NULL handling, NaN/Inf behavior.
 
-- [ ] Consider selected-index output
-  - Add a function such as `lttb_indices(x, y, n)`.
-  - Useful for frontends that want to reuse original columns without
-    reconstructing points.
-  - Note: no precedent in ClickHouse or Python `lttb`; `plotly-resampler`'s
-    `FuncAggregator` can return indices when `x is None`.
+- [x] Consider selected-index output
+  - Added `lttb_indices(x, y, n)` function that returns `BIGINT[]` of selected
+    sorted-position indices. Useful for frontends that want to know which
+    points were selected without reconstructing the full point values.
 
 - [ ] Design `minmax_lttb` approximate path
   - Reference: `plotly-resampler` `MinMaxLTTB` — min-max preselection then LTTB,
