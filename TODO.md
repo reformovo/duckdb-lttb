@@ -150,9 +150,19 @@ operate on doubles internally; type conversion happens at I/O boundaries.
   - `lttb_sorted` and `lttb_indices` function tests.
   - Total: 99 assertions, all pass.
 
-- [ ] Add benchmarks
-  - Include 100K and 1M point single-series benchmarks.
-  - Track sort, sampling, and finalize output costs.
+- [x] Add benchmarks
+  - Added `scripts/benchmark_lttb.sh` — a shell script that measures LTTB
+    performance at 100K and 1M point scales using DuckDB's `.timer` CLI command.
+  - Covers: `lttb` vs `lttb_sorted` vs `lttb_indices`, output sizes n=100/1000/10000,
+    DOUBLE vs TIMESTAMP input, single-series vs 100-group multi-group, sorted vs
+    shuffled input (sort cost isolation).
+  - Baseline results recorded in `docs/benchmark-results.txt`.
+  - Key findings (1M points, n=1000):
+    - `lttb` on sorted input: ~15ms (sort ~7ms, sampling+finalize ~8ms)
+    - `lttb_sorted` on sorted input: ~8ms (no sort)
+    - `lttb` on shuffled input: ~70ms (sort dominates on random-order data)
+    - TIMESTAMP type conversion overhead: negligible (~0ms vs DOUBLE)
+    - Multi-group (100 groups): ~11ms (combine overhead minimal)
   - Reference bar: `plotly-resampler` uses `tsdownsample` Rust bindings with
     parallelization.
 
@@ -177,15 +187,12 @@ operate on doubles internally; type conversion happens at I/O boundaries.
 
 ## Recommended Next Step
 
-The P0 type-preserving LTTB epic and most P1/P2/P3 items are complete. The
-remaining work is:
+The P0 type-preserving LTTB epic, most P1/P2/P3 items, and benchmarks are
+complete. The remaining work is:
 
-1. **Benchmarks** (P3): add 100K and 1M point single-series benchmarks to
-   track sort, sampling, and finalize costs. Reference bar: `plotly-resampler`
-   uses `tsdownsample` Rust bindings with parallelization.
-2. **`minmax_lttb`** (P2): implement the two-stage min-max preselection then
+1. **`minmax_lttb`** (P2): implement the two-stage min-max preselection then
    LTTB approximate path, referencing `plotly-resampler`'s `MinMaxLTTB`.
    Elevate to P1 if users report hitting the `1 << 30` point guard.
-3. **Memory guard controls** (P1, deferred): add user-configurable max points
+2. **Memory guard controls** (P1, deferred): add user-configurable max points
    per group via a PRAGMA setting or FunctionData. Requires a configuration
    mechanism.
