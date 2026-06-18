@@ -180,6 +180,12 @@ SELECT list_transform(lttb(x, y, 4), lambda p: format('({}, {})', p.x::BIGINT, p
 statement ok
 DROP TABLE lttb_dup_x;
 
+# Duplicate x with n < input_size: exercises bucket selection with duplicate x.
+query I
+SELECT list_transform(lttb(x, y, 3), lambda p: format('({}, {})', p.x::BIGINT, p.y::BIGINT)) FROM (VALUES (1.0, 10.0), (1.0, 20.0), (2.0, 30.0), (2.0, 40.0), (3.0, 50.0), (3.0, 60.0)) AS t(x, y);
+----
+['(1, 10)', '(1, 20)', '(3, 60)']
+
 # All-invalid input tests.
 query I
 SELECT list_transform(lttb('NaN'::DOUBLE, 1.0, 1), lambda p: format('({}, {})', p.x::BIGINT, p.y::BIGINT));

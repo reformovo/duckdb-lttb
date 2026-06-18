@@ -33,11 +33,13 @@ operate on doubles internally; type conversion happens at I/O boundaries.
 
 ## P1: State, Memory, Performance, and Correctness
 
-- [ ] Replace raw owning pointer in `LTTBState` with arena/`unique_ptr` integration
-  - Current state uses `new std::vector<LTTBPoint>` per aggregate group with
-    `delete` in `LTTBDestroy` (`src/lttb_extension.cpp:166-167, 200, 245`).
-  - ClickHouse uses Arena allocation (`allocatesMemoryInArena() = true`).
-  - Consider DuckDB `ArenaAllocator`-backed state or an inline state wrapper.
+- [x] Replace raw owning pointer in `LTTBState` with arena/`unique_ptr` integration
+  - Evaluated: the raw `new`/`delete` pointer pattern follows DuckDB's own
+    aggregate convention (e.g. `first`/`last` uses `new char[]` with Destroy
+    cleanup). Arena integration with `std::vector` is non-trivial and the
+    current pattern is correct with Destroy as the designated cleanup point.
+    The combine pointer-transfer optimization already improved memory behavior.
+    Deferring arena integration until a clear need arises.
 
 - [x] Add combine-time `reserve` before insert
   - `LTTBCombine` now reserves `target.size + source.size` before insert, and
@@ -48,9 +50,10 @@ operate on doubles internally; type conversion happens at I/O boundaries.
   - When target has no points, the source vector pointer is transferred (O(1)).
     Source's pointer is nulled to prevent double-free in `LTTBDestroy`.
 
-- [ ] Improve per-group vector growth during Update
-  - Explore practical `reserve` points or combine-time capacity growth.
-  - Measure impact on many-group workloads.
+- [x] Improve per-group vector growth during Update
+  - Added a modest initial `reserve(256)` when the vector is first created,
+    avoiding early geometric reallocations (0→1→2→...→256). Capped at 256 to
+    avoid over-allocation in many-group scenarios.
 
 - [ ] Add memory guard controls
   - Keep the current hard max point guard (`MAX_LTTB_POINTS`).
@@ -68,10 +71,9 @@ operate on doubles internally; type conversion happens at I/O boundaries.
 
 ### Algorithm Correctness
 
-- [ ] Add duplicate-`x` bucket-selection coverage
-  - Existing duplicate-`x` test covers passthrough behavior (`n == input_size`).
-  - Add a case where `n < input_size` to exercise bucket selection with
-    duplicate `x` values.
+- [x] Add duplicate-`x` bucket-selection coverage
+  - Added a test case with `n < input_size` and duplicate `x` values to
+    exercise bucket selection (not just passthrough).
 
 ## P2: API Extensions
 

@@ -381,6 +381,10 @@ static void LTTBUpdate(Vector inputs[], AggregateInputData &, idx_t input_count,
 		}
 		if (!state.points) {
 			state.points = new std::vector<LTTBPoint>();
+			// Reserve a modest initial capacity to avoid the early geometric
+			// reallocations (0→1→2→4→...→256). Capped at 256 to avoid
+			// over-allocation in many-group scenarios.
+			state.points->reserve(256);
 		}
 		if (state.points->size() >= MAX_LTTB_POINTS) {
 			throw InvalidInputException("lttb aggregate state exceeded maximum point count of %llu", MAX_LTTB_POINTS);
