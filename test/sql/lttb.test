@@ -252,6 +252,18 @@ SELECT list_transform(lttb(x, y, 2), lambda p: format('({}, {})', strftime(p.x, 
 ----
 ['(2023-01-01, 10.0)', '(2023-06-01, 20.0)']
 
+# TIMESTAMP_S round-trip (seconds resolution).
+query I
+SELECT list_transform(lttb(x, y, 2), lambda p: format('({}, {})', strftime(p.x, '%Y-%m-%d'), p.y)) FROM (VALUES (TIMESTAMP_S '2023-01-01 00:00:00', 10.0), (TIMESTAMP_S '2023-06-01 00:00:00', 20.0)) AS t(x, y);
+----
+['(2023-01-01, 10.0)', '(2023-06-01, 20.0)']
+
+# TIMESTAMP_MS round-trip (milliseconds resolution).
+query I
+SELECT list_transform(lttb(x, y, 2), lambda p: format('({}, {})', strftime(p.x, '%Y-%m-%d'), p.y)) FROM (VALUES (TIMESTAMP_MS '2023-01-01 00:00:00', 10.0), (TIMESTAMP_MS '2023-06-01 00:00:00', 20.0)) AS t(x, y);
+----
+['(2023-01-01, 10.0)', '(2023-06-01, 20.0)']
+
 # GROUP BY with typed x.
 query II rowsort
 SELECT g, list_transform(lttb(x, y, 2), lambda p: format('({}, {})', p.x, p.y))

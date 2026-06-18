@@ -6,6 +6,7 @@
 #include "duckdb/common/types/decimal.hpp"
 #include "duckdb/common/types/hugeint.hpp"
 #include "duckdb/common/types/timestamp.hpp"
+#include "duckdb/common/types/uhugeint.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/function/aggregate_function.hpp"
 
@@ -47,15 +48,30 @@ static double ReadAsDouble(const UnifiedVectorFormat &data, idx_t row_idx, const
 		return UnifiedVectorFormat::GetData<double>(data)[idx];
 	case LogicalTypeId::FLOAT:
 		return static_cast<double>(UnifiedVectorFormat::GetData<float>(data)[idx]);
+	case LogicalTypeId::TINYINT:
+		return static_cast<double>(UnifiedVectorFormat::GetData<int8_t>(data)[idx]);
 	case LogicalTypeId::SMALLINT:
 		return static_cast<double>(UnifiedVectorFormat::GetData<int16_t>(data)[idx]);
 	case LogicalTypeId::INTEGER:
 		return static_cast<double>(UnifiedVectorFormat::GetData<int32_t>(data)[idx]);
 	case LogicalTypeId::BIGINT:
 		return static_cast<double>(UnifiedVectorFormat::GetData<int64_t>(data)[idx]);
+	case LogicalTypeId::UTINYINT:
+		return static_cast<double>(UnifiedVectorFormat::GetData<uint8_t>(data)[idx]);
+	case LogicalTypeId::USMALLINT:
+		return static_cast<double>(UnifiedVectorFormat::GetData<uint16_t>(data)[idx]);
+	case LogicalTypeId::UINTEGER:
+		return static_cast<double>(UnifiedVectorFormat::GetData<uint32_t>(data)[idx]);
+	case LogicalTypeId::UBIGINT:
+		return static_cast<double>(UnifiedVectorFormat::GetData<uint64_t>(data)[idx]);
 	case LogicalTypeId::HUGEINT: {
 		double result = 0;
 		Hugeint::TryCast(UnifiedVectorFormat::GetData<hugeint_t>(data)[idx], result);
+		return result;
+	}
+	case LogicalTypeId::UHUGEINT: {
+		double result = 0;
+		Uhugeint::TryCast(UnifiedVectorFormat::GetData<uhugeint_t>(data)[idx], result);
 		return result;
 	}
 	case LogicalTypeId::DATE:
@@ -63,15 +79,20 @@ static double ReadAsDouble(const UnifiedVectorFormat &data, idx_t row_idx, const
 		return static_cast<double>(Date::EpochDays(UnifiedVectorFormat::GetData<date_t>(data)[idx]));
 	case LogicalTypeId::TIMESTAMP:
 	case LogicalTypeId::TIMESTAMP_TZ:
-		// timestamp_t is microseconds since epoch; losslessly representable in a
-		// double (53-bit mantissa) for all practical dates (until ~2250 CE).
-		return static_cast<double>(Timestamp::GetEpochMicroSeconds(UnifiedVectorFormat::GetData<timestamp_t>(data)[idx]));
+		// timestamp_t / timestamp_tz_t hold microseconds since epoch; losslessly
+		// representable in a double (53-bit mantissa) for all practical dates
+		// (until ~2250 CE).
+		return static_cast<double>(Timestamp::GetEpochMicroSeconds(
+		    UnifiedVectorFormat::GetData<timestamp_t>(data)[idx]));
 	case LogicalTypeId::TIMESTAMP_SEC:
-		return static_cast<double>(Timestamp::GetEpochSeconds(UnifiedVectorFormat::GetData<timestamp_t>(data)[idx]));
+		// timestamp_sec_t holds seconds since epoch directly.
+		return static_cast<double>(UnifiedVectorFormat::GetData<timestamp_sec_t>(data)[idx].value);
 	case LogicalTypeId::TIMESTAMP_MS:
-		return static_cast<double>(Timestamp::GetEpochMs(UnifiedVectorFormat::GetData<timestamp_t>(data)[idx]));
+		// timestamp_ms_t holds milliseconds since epoch directly.
+		return static_cast<double>(UnifiedVectorFormat::GetData<timestamp_ms_t>(data)[idx].value);
 	case LogicalTypeId::TIMESTAMP_NS:
-		return static_cast<double>(Timestamp::GetEpochNanoSeconds(UnifiedVectorFormat::GetData<timestamp_ns_t>(data)[idx]));
+		// timestamp_ns_t holds nanoseconds since epoch directly.
+		return static_cast<double>(UnifiedVectorFormat::GetData<timestamp_ns_t>(data)[idx].value);
 	case LogicalTypeId::DECIMAL: {
 		// Round-trip through double is lossy for DECIMALs with >15 significant
 		// digits. Acceptable for LTTB's visualization use case.
@@ -109,6 +130,9 @@ static void WriteFromDouble(Vector &vec, idx_t offset, double value, const Logic
 	case LogicalTypeId::FLOAT:
 		FlatVector::GetData<float>(vec)[offset] = static_cast<float>(value);
 		break;
+	case LogicalTypeId::TINYINT:
+		FlatVector::GetData<int8_t>(vec)[offset] = static_cast<int8_t>(value);
+		break;
 	case LogicalTypeId::SMALLINT:
 		FlatVector::GetData<int16_t>(vec)[offset] = static_cast<int16_t>(value);
 		break;
@@ -118,10 +142,28 @@ static void WriteFromDouble(Vector &vec, idx_t offset, double value, const Logic
 	case LogicalTypeId::BIGINT:
 		FlatVector::GetData<int64_t>(vec)[offset] = static_cast<int64_t>(value);
 		break;
+	case LogicalTypeId::UTINYINT:
+		FlatVector::GetData<uint8_t>(vec)[offset] = static_cast<uint8_t>(value);
+		break;
+	case LogicalTypeId::USMALLINT:
+		FlatVector::GetData<uint16_t>(vec)[offset] = static_cast<uint16_t>(value);
+		break;
+	case LogicalTypeId::UINTEGER:
+		FlatVector::GetData<uint32_t>(vec)[offset] = static_cast<uint32_t>(value);
+		break;
+	case LogicalTypeId::UBIGINT:
+		FlatVector::GetData<uint64_t>(vec)[offset] = static_cast<uint64_t>(value);
+		break;
 	case LogicalTypeId::HUGEINT: {
 		hugeint_t result;
 		Hugeint::TryConvert(value, result);
 		FlatVector::GetData<hugeint_t>(vec)[offset] = result;
+		break;
+	}
+	case LogicalTypeId::UHUGEINT: {
+		uhugeint_t result;
+		Uhugeint::TryConvert(value, result);
+		FlatVector::GetData<uhugeint_t>(vec)[offset] = result;
 		break;
 	}
 	case LogicalTypeId::DATE:
@@ -133,13 +175,16 @@ static void WriteFromDouble(Vector &vec, idx_t offset, double value, const Logic
 		    Timestamp::FromEpochMicroSeconds(static_cast<int64_t>(value));
 		break;
 	case LogicalTypeId::TIMESTAMP_SEC:
-		FlatVector::GetData<timestamp_t>(vec)[offset] = Timestamp::FromEpochSeconds(static_cast<int64_t>(value));
+		FlatVector::GetData<timestamp_sec_t>(vec)[offset] =
+		    timestamp_sec_t(static_cast<int64_t>(value));
 		break;
 	case LogicalTypeId::TIMESTAMP_MS:
-		FlatVector::GetData<timestamp_t>(vec)[offset] = Timestamp::FromEpochMs(static_cast<int64_t>(value));
+		FlatVector::GetData<timestamp_ms_t>(vec)[offset] =
+		    timestamp_ms_t(static_cast<int64_t>(value));
 		break;
 	case LogicalTypeId::TIMESTAMP_NS:
-		FlatVector::GetData<timestamp_ns_t>(vec)[offset] = timestamp_ns_t(static_cast<int64_t>(value));
+		FlatVector::GetData<timestamp_ns_t>(vec)[offset] =
+		    timestamp_ns_t(static_cast<int64_t>(value));
 		break;
 	case LogicalTypeId::DECIMAL: {
 		const auto scale = DecimalType::GetScale(type);
@@ -176,10 +221,16 @@ static bool IsLTTBSupportedType(const LogicalType &type) {
 	switch (type.id()) {
 	case LogicalTypeId::DOUBLE:
 	case LogicalTypeId::FLOAT:
+	case LogicalTypeId::TINYINT:
 	case LogicalTypeId::SMALLINT:
 	case LogicalTypeId::INTEGER:
 	case LogicalTypeId::BIGINT:
+	case LogicalTypeId::UTINYINT:
+	case LogicalTypeId::USMALLINT:
+	case LogicalTypeId::UINTEGER:
+	case LogicalTypeId::UBIGINT:
 	case LogicalTypeId::HUGEINT:
+	case LogicalTypeId::UHUGEINT:
 	case LogicalTypeId::DATE:
 	case LogicalTypeId::TIMESTAMP:
 	case LogicalTypeId::TIMESTAMP_TZ:
