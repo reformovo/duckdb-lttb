@@ -310,6 +310,19 @@ SELECT list_transform(lttb_sorted(x, y, 2), lambda p: format('({}, {})', strftim
 ----
 ['(2023-01-01, 10.0)', '(2023-06-01, 20.0)']
 
+# Inf handling: Inf is kept (parity with ClickHouse and Python lttb, which
+# also filter NaN but not Inf). Inf x sorts to the extreme; Inf y can be
+# selected because the triangle area becomes Inf (greater than any finite area).
+query I
+SELECT list_transform(lttb(x, y, 3), lambda p: format('({}, {})', p.x, p.y)) FROM (VALUES (1.0, 10.0), (2.0, 20.0), ('Infinity'::DOUBLE, 30.0), (4.0, 40.0), (5.0, 50.0)) AS t(x, y);
+----
+['(1.0, 10.0)', '(2.0, 20.0)', '(inf, 30.0)']
+
+query I
+SELECT list_transform(lttb(x, y, 3), lambda p: format('({}, {})', p.x, p.y)) FROM (VALUES (1.0, 10.0), (2.0, 20.0), ('-Infinity'::DOUBLE, 30.0), (4.0, 40.0), (5.0, 50.0)) AS t(x, y);
+----
+['(-inf, 30.0)', '(1.0, 10.0)', '(5.0, 50.0)']
+
 statement ok
 DROP TABLE lttb_ts_input;
 

@@ -138,13 +138,11 @@ operate on doubles internally; type conversion happens at I/O boundaries.
   - Changed from `idx_t(1) << 30` to `1ULL << 30` to match ClickHouse's
     `MAX_ARRAY_SIZE` verbatim.
 
-- [ ] Pin Inf handling behavior
-  - All three implementations (DuckDB, ClickHouse, Python `lttb`) filter NaN but
-    not Inf. Inf x/y sorts to extremes and produces Inf-area triangles.
-  - Decide: filter Inf (parity-plus) or document as-is (parity), then add a
-    SQLLogicTest for Inf input to pin whichever behavior is chosen.
-  - Reference: ClickHouse issue #64745 / PR #62646 show Inf/NaN sorting behavior
-    changed across versions.
+- [x] Pin Inf handling behavior
+  - Decision: keep Inf (parity with ClickHouse and Python `lttb`, which also
+    filter NaN but not Inf). Inf x sorts to the extreme; Inf y can be selected
+    because the triangle area becomes Inf. SQLLogicTests added for +Inf and
+    -Inf x input to pin the behavior.
 
 - [ ] Document the implicit-cast input contract
   - `LTTBBindFunction` (`src/lttb_extension.cpp:263-273`) resolves `ANY, ANY`
