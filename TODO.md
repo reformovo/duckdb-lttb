@@ -39,17 +39,14 @@ operate on doubles internally; type conversion happens at I/O boundaries.
   - ClickHouse uses Arena allocation (`allocatesMemoryInArena() = true`).
   - Consider DuckDB `ArenaAllocator`-backed state or an inline state wrapper.
 
-- [ ] Add combine-time `reserve` before insert
-  - `LTTBCombine` (`src/lttb_extension.cpp:205`) inserts source points into the
-    target vector without reserving, triggering geometric reallocation per
-    combine for many partial states.
-  - Add `target.points->reserve(target.points->size() + source.points->size())`
-    before `insert`.
+- [x] Add combine-time `reserve` before insert
+  - `LTTBCombine` now reserves `target.size + source.size` before insert, and
+    transfers the source vector pointer entirely when the target is empty (O(1)
+    pointer transfer instead of copy).
 
-- [ ] Move-based combine (avoid copy entirely)
-  - `LTTBDestroy` runs on the source state after `LTTBCombine`, so the source
-    vector can be `std::move`d (or `swap`+let-destruct) into the target instead
-    of copied. Correctness-safe O(1) transfer.
+- [x] Move-based combine (avoid copy entirely)
+  - When target has no points, the source vector pointer is transferred (O(1)).
+    Source's pointer is nulled to prevent double-free in `LTTBDestroy`.
 
 - [ ] Improve per-group vector growth during Update
   - Explore practical `reserve` points or combine-time capacity growth.

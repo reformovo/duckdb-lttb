@@ -413,11 +413,18 @@ static void LTTBCombine(Vector &state_vector, Vector &combined, AggregateInputDa
 			continue;
 		}
 		if (!target.points) {
-			target.points = new std::vector<LTTBPoint>();
+			// Target has no points — take ownership of the source vector entirely
+			// (O(1) pointer transfer). Source's points pointer is nulled so
+			// LTTBDestroy won't double-free.
+			target.points = source.points;
+			source.points = nullptr;
+			continue;
 		}
 		if (target.points->size() + source.points->size() > MAX_LTTB_POINTS) {
 			throw InvalidInputException("lttb aggregate state exceeded maximum point count of %llu", MAX_LTTB_POINTS);
 		}
+		// Reserve before insert to avoid geometric reallocation per combine.
+		target.points->reserve(target.points->size() + source.points->size());
 		target.points->insert(target.points->end(), source.points->begin(), source.points->end());
 	}
 }
