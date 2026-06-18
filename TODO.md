@@ -177,9 +177,15 @@ operate on doubles internally; type conversion happens at I/O boundaries.
 
 ## Recommended Next Step
 
-Implement the P0 type-preserving LTTB epic (direct typed input + typed output
-path) as the first follow-up, with focused SQLLogicTests for direct `DATE` and
-`TIMESTAMP` input and asserted output types. Then batch the P1 combine
-performance fixes (reserve + move, plus the sorted fast path) and the P3
-code-quality cleanups (`next_count`, `%llu`, `MAX_LTTB_POINTS`, ownership
-comment) into a single mechanical follow-up PR.
+The P0 type-preserving LTTB epic and most P1/P2/P3 items are complete. The
+remaining work is:
+
+1. **Benchmarks** (P3): add 100K and 1M point single-series benchmarks to
+   track sort, sampling, and finalize costs. Reference bar: `plotly-resampler`
+   uses `tsdownsample` Rust bindings with parallelization.
+2. **`minmax_lttb`** (P2): implement the two-stage min-max preselection then
+   LTTB approximate path, referencing `plotly-resampler`'s `MinMaxLTTB`.
+   Elevate to P1 if users report hitting the `1 << 30` point guard.
+3. **Memory guard controls** (P1, deferred): add user-configurable max points
+   per group via a PRAGMA setting or FunctionData. Requires a configuration
+   mechanism.
