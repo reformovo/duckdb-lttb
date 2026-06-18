@@ -8,34 +8,28 @@ PR #57003, PR #84479) and the Python ecosystem (`lttb` PyPI package,
 `plotly-resampler` `MinMaxLTTB`/`LTTB`, `tsdownsample`). See
 `docs/reference/clickhouse-lttb.md` for the archived ClickHouse reference.
 
-## P0: Type-Preserving LTTB (Input + Output)
+## P0: Type-Preserving LTTB (Input + Output) — DONE
 
-This is the biggest functional gap vs both ClickHouse and Python `lttb`: both
-preserve the original x type (Date/DateTime/datetime64) in the output, while
-DuckDB always returns `STRUCT(x DOUBLE, y DOUBLE)[]` and relies on implicit
-casts for input. The decision phase is complete — match ClickHouse's typed
-`Array(Tuple(...))` pattern.
+Implemented in commit following `84f1945`. The extension now accepts direct
+typed input (DATE, TIMESTAMP, TIMESTAMPTZ, TIMESTAMP_S, TIMESTAMP_MS,
+TIMESTAMP_NS, DECIMAL, FLOAT, SMALLINT, INTEGER, BIGINT, HUGEINT, DOUBLE) and
+preserves both x and y types in the output `STRUCT(x typed, y typed)[]`,
+matching ClickHouse `Array(Tuple(...))` semantics. The algorithm continues to
+operate on doubles internally; type conversion happens at I/O boundaries.
 
-- [ ] Add direct `DATE` / `TIMESTAMP` typed input support
-  - Do not rely on DuckDB implicit `TIMESTAMP -> DOUBLE` casts.
-  - Add typed update paths that read physical `date_t` / `timestamp_t` values
-    and convert to epoch doubles for the algorithm.
-  - Add SQLLogicTests for direct `DATE` and direct `TIMESTAMP` input (the
-    existing datetime test at `test/sql/lttb.test` manually uses
-    `epoch(x)::DOUBLE`; add a direct `lttb(x, y, n)` variant).
+- [x] Add direct `DATE` / `TIMESTAMP` typed input support
+  - Typed update paths read physical `date_t` / `timestamp_t` values and convert
+    to epoch doubles via `ReadAsDouble`. SQLLogicTests cover direct DATE and
+    TIMESTAMP input.
+  - All temporal variants (TIMESTAMPTZ, TIMESTAMP_S/MS/NS) also supported.
 
-- [ ] Implement type-preserving output path
-  - Resolve the output struct's x type at bind time from the input x type
-    (DATE -> DATE, TIMESTAMP -> TIMESTAMP, DECIMAL -> DECIMAL, DOUBLE -> DOUBLE).
-  - Match ClickHouse `Array(Tuple(typed_x, typed_y))` semantics so users do not
-    need to reconstruct timestamps via `to_timestamp(p.x)`.
-  - Keep a DOUBLE fallback for numeric inputs.
-  - Add SQLLogicTests asserting preserved output types.
+- [x] Implement type-preserving output path
+  - Bind resolves output struct x/y types from input types. Finalize writes
+    typed values via `WriteFromDouble`. SQLLogicTests assert preserved types.
 
-- [ ] Evaluate additional temporal variants
-  - Consider `TIMESTAMP_S`, `TIMESTAMP_MS`, `TIMESTAMP_NS`, and `TIMESTAMP_TZ`.
-  - Document unsupported variants explicitly if not implemented.
-  - Reference: ClickHouse accepts Date/Date32/DateTime/DateTime64.
+- [x] Evaluate additional temporal variants
+  - TIMESTAMP_S, TIMESTAMP_MS, TIMESTAMP_NS, TIMESTAMPTZ all supported.
+  - TIMESTAMP_TZ is physically identical to TIMESTAMP (micros).
 
 ## P1: State, Memory, Performance, and Correctness
 
@@ -121,10 +115,9 @@ casts for input. The decision phase is complete — match ClickHouse's typed
 
 ## P3: Code Quality, Simplify, and Readability
 
-- [ ] Remove dead `next_count` ternary fallback
-  - `src/lttb_extension.cpp:77`: the `idx_t(1)` branch is dead — the `else`
-    branch at lines 85-88 bypasses `next_count`. Move `next_count` inside the
-    `if` branch and drop the dead fallback.
+- [x] Remove dead `next_count` ternary fallback
+  - Fixed in the P0 commit: `next_count` moved inside the `if` branch, dead
+    `idx_t(1)` fallback removed.
 
 - [ ] Fix `%llu` portability for `idx_t`
   - `src/lttb_extension.cpp:170, 203`: `idx_t` is `uint64_t`; `%llu` is wrong on

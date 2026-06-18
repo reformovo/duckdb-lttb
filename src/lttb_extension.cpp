@@ -1,8 +1,12 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "lttb_extension.hpp"
-#include "duckdb/common/types/vector.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/types/date.hpp"
+#include "duckdb/common/types/decimal.hpp"
+#include "duckdb/common/types/hugeint.hpp"
+#include "duckdb/common/types/timestamp.hpp"
+#include "duckdb/common/types/vector.hpp"
 #include "duckdb/function/aggregate_function.hpp"
 
 #include <algorithm>
@@ -31,6 +35,164 @@ static bool IsValidPoint(double x, double y) {
 	return !std::isnan(x) && !std::isnan(y);
 }
 
+// Read a value of the given logical type from a unified-format vector at row_idx
+// and convert it to double for the LTTB algorithm. The conversion is monotonic
+// for every supported type (numeric, date, timestamp), so sorting on the
+// resulting doubles preserves the correct ordering of the original typed values.
+static double ReadAsDouble(const UnifiedVectorFormat &data, idx_t row_idx, const LogicalType &type) {
+	const auto idx = data.sel->get_index(row_idx);
+	// Caller is responsible for the validity check; this helper assumes a valid row.
+	switch (type.id()) {
+	case LogicalTypeId::DOUBLE:
+		return UnifiedVectorFormat::GetData<double>(data)[idx];
+	case LogicalTypeId::FLOAT:
+		return static_cast<double>(UnifiedVectorFormat::GetData<float>(data)[idx]);
+	case LogicalTypeId::SMALLINT:
+		return static_cast<double>(UnifiedVectorFormat::GetData<int16_t>(data)[idx]);
+	case LogicalTypeId::INTEGER:
+		return static_cast<double>(UnifiedVectorFormat::GetData<int32_t>(data)[idx]);
+	case LogicalTypeId::BIGINT:
+		return static_cast<double>(UnifiedVectorFormat::GetData<int64_t>(data)[idx]);
+	case LogicalTypeId::HUGEINT: {
+		double result = 0;
+		Hugeint::TryCast(UnifiedVectorFormat::GetData<hugeint_t>(data)[idx], result);
+		return result;
+	}
+	case LogicalTypeId::DATE:
+		// date_t is days since 1970-01-01; lossless double round-trip.
+		return static_cast<double>(Date::EpochDays(UnifiedVectorFormat::GetData<date_t>(data)[idx]));
+	case LogicalTypeId::TIMESTAMP:
+	case LogicalTypeId::TIMESTAMP_TZ:
+		// timestamp_t is microseconds since epoch; losslessly representable in a
+		// double (53-bit mantissa) for all practical dates (until ~2250 CE).
+		return static_cast<double>(Timestamp::GetEpochMicroSeconds(UnifiedVectorFormat::GetData<timestamp_t>(data)[idx]));
+	case LogicalTypeId::TIMESTAMP_SEC:
+		return static_cast<double>(Timestamp::GetEpochSeconds(UnifiedVectorFormat::GetData<timestamp_t>(data)[idx]));
+	case LogicalTypeId::TIMESTAMP_MS:
+		return static_cast<double>(Timestamp::GetEpochMs(UnifiedVectorFormat::GetData<timestamp_t>(data)[idx]));
+	case LogicalTypeId::TIMESTAMP_NS:
+		return static_cast<double>(Timestamp::GetEpochNanoSeconds(UnifiedVectorFormat::GetData<timestamp_ns_t>(data)[idx]));
+	case LogicalTypeId::DECIMAL: {
+		// Round-trip through double is lossy for DECIMALs with >15 significant
+		// digits. Acceptable for LTTB's visualization use case.
+		const auto scale = DecimalType::GetScale(type);
+		double divisor = 1.0;
+		for (uint8_t i = 0; i < scale; i++) {
+			divisor *= 10.0;
+		}
+		switch (type.InternalType()) {
+		case PhysicalType::INT16:
+			return static_cast<double>(UnifiedVectorFormat::GetData<int16_t>(data)[idx]) / divisor;
+		case PhysicalType::INT32:
+			return static_cast<double>(UnifiedVectorFormat::GetData<int32_t>(data)[idx]) / divisor;
+		case PhysicalType::INT64:
+			return static_cast<double>(UnifiedVectorFormat::GetData<int64_t>(data)[idx]) / divisor;
+		default: {
+			double result = 0;
+			Hugeint::TryCast(UnifiedVectorFormat::GetData<hugeint_t>(data)[idx], result);
+			return result / divisor;
+		}
+		}
+	}
+	default:
+		throw InternalException("Unsupported LTTB input type: %s", type.ToString());
+	}
+}
+
+// Write a double value back into a flat vector at the given offset, converting
+// it to the vector's logical type. Inverse of ReadAsDouble.
+static void WriteFromDouble(Vector &vec, idx_t offset, double value, const LogicalType &type) {
+	switch (type.id()) {
+	case LogicalTypeId::DOUBLE:
+		FlatVector::GetData<double>(vec)[offset] = value;
+		break;
+	case LogicalTypeId::FLOAT:
+		FlatVector::GetData<float>(vec)[offset] = static_cast<float>(value);
+		break;
+	case LogicalTypeId::SMALLINT:
+		FlatVector::GetData<int16_t>(vec)[offset] = static_cast<int16_t>(value);
+		break;
+	case LogicalTypeId::INTEGER:
+		FlatVector::GetData<int32_t>(vec)[offset] = static_cast<int32_t>(value);
+		break;
+	case LogicalTypeId::BIGINT:
+		FlatVector::GetData<int64_t>(vec)[offset] = static_cast<int64_t>(value);
+		break;
+	case LogicalTypeId::HUGEINT: {
+		hugeint_t result;
+		Hugeint::TryConvert(value, result);
+		FlatVector::GetData<hugeint_t>(vec)[offset] = result;
+		break;
+	}
+	case LogicalTypeId::DATE:
+		FlatVector::GetData<date_t>(vec)[offset] = Date::EpochDaysToDate(static_cast<int32_t>(value));
+		break;
+	case LogicalTypeId::TIMESTAMP:
+	case LogicalTypeId::TIMESTAMP_TZ:
+		FlatVector::GetData<timestamp_t>(vec)[offset] =
+		    Timestamp::FromEpochMicroSeconds(static_cast<int64_t>(value));
+		break;
+	case LogicalTypeId::TIMESTAMP_SEC:
+		FlatVector::GetData<timestamp_t>(vec)[offset] = Timestamp::FromEpochSeconds(static_cast<int64_t>(value));
+		break;
+	case LogicalTypeId::TIMESTAMP_MS:
+		FlatVector::GetData<timestamp_t>(vec)[offset] = Timestamp::FromEpochMs(static_cast<int64_t>(value));
+		break;
+	case LogicalTypeId::TIMESTAMP_NS:
+		FlatVector::GetData<timestamp_ns_t>(vec)[offset] = timestamp_ns_t(static_cast<int64_t>(value));
+		break;
+	case LogicalTypeId::DECIMAL: {
+		const auto scale = DecimalType::GetScale(type);
+		double multiplier = 1.0;
+		for (uint8_t i = 0; i < scale; i++) {
+			multiplier *= 10.0;
+		}
+		const auto scaled = std::llround(value * multiplier);
+		switch (type.InternalType()) {
+		case PhysicalType::INT16:
+			FlatVector::GetData<int16_t>(vec)[offset] = static_cast<int16_t>(scaled);
+			break;
+		case PhysicalType::INT32:
+			FlatVector::GetData<int32_t>(vec)[offset] = static_cast<int32_t>(scaled);
+			break;
+		case PhysicalType::INT64:
+			FlatVector::GetData<int64_t>(vec)[offset] = static_cast<int64_t>(scaled);
+			break;
+		default: {
+			hugeint_t result;
+			Hugeint::TryConvert(value * multiplier, result);
+			FlatVector::GetData<hugeint_t>(vec)[offset] = result;
+			break;
+		}
+		}
+		break;
+	}
+	default:
+		throw InternalException("Unsupported LTTB output type: %s", type.ToString());
+	}
+}
+
+static bool IsLTTBSupportedType(const LogicalType &type) {
+	switch (type.id()) {
+	case LogicalTypeId::DOUBLE:
+	case LogicalTypeId::FLOAT:
+	case LogicalTypeId::SMALLINT:
+	case LogicalTypeId::INTEGER:
+	case LogicalTypeId::BIGINT:
+	case LogicalTypeId::HUGEINT:
+	case LogicalTypeId::DATE:
+	case LogicalTypeId::TIMESTAMP:
+	case LogicalTypeId::TIMESTAMP_TZ:
+	case LogicalTypeId::TIMESTAMP_SEC:
+	case LogicalTypeId::TIMESTAMP_MS:
+	case LogicalTypeId::TIMESTAMP_NS:
+	case LogicalTypeId::DECIMAL:
+		return true;
+	default:
+		return false;
+	}
+}
+
 static std::vector<LTTBPoint> Downsample(std::vector<LTTBPoint> &points, uint64_t buckets) {
 	// No buckets requested — return empty immediately, no sorting needed.
 	if (buckets == 0) {
@@ -38,6 +200,8 @@ static std::vector<LTTBPoint> Downsample(std::vector<LTTBPoint> &points, uint64_
 	}
 
 	// Stable sort: preserve insertion order for equal x values.
+	// Epoch-double conversion is monotonic for all supported types, so sorting
+	// on doubles preserves correct temporal ordering.
 	std::stable_sort(points.begin(), points.end(),
 	                 [](const LTTBPoint &lhs, const LTTBPoint &rhs) { return lhs.x < rhs.x; });
 
@@ -74,8 +238,8 @@ static std::vector<LTTBPoint> Downsample(std::vector<LTTBPoint> &points, uint64_
 
 		double avg_x = 0;
 		double avg_y = 0;
-		const auto next_count = next_end > next_start ? next_end - next_start : idx_t(1);
 		if (next_end > next_start) {
+			const auto next_count = next_end - next_start;
 			for (idx_t i = next_start; i < next_end; i++) {
 				avg_x += points[i].x;
 				avg_y += points[i].y;
@@ -132,9 +296,10 @@ static void LTTBUpdate(Vector inputs[], AggregateInputData &, idx_t input_count,
 	inputs[0].ToUnifiedFormat(count, x_data);
 	inputs[1].ToUnifiedFormat(count, y_data);
 	inputs[2].ToUnifiedFormat(count, buckets_data);
-	auto x_values = UnifiedVectorFormat::GetData<double>(x_data);
-	auto y_values = UnifiedVectorFormat::GetData<double>(y_data);
 	auto buckets_values = UnifiedVectorFormat::GetData<int64_t>(buckets_data);
+
+	const auto &x_type = inputs[0].GetType();
+	const auto &y_type = inputs[1].GetType();
 
 	for (idx_t row = 0; row < count; row++) {
 		const auto x_index = x_data.sel->get_index(row);
@@ -158,8 +323,8 @@ static void LTTBUpdate(Vector inputs[], AggregateInputData &, idx_t input_count,
 			throw InvalidInputException("lttb bucket count must be constant within each aggregate group");
 		}
 
-		const auto x = x_values[x_index];
-		const auto y = y_values[y_index];
+		const auto x = ReadAsDouble(x_data, row, x_type);
+		const auto y = ReadAsDouble(y_data, row, y_type);
 		if (!IsValidPoint(x, y)) {
 			continue;
 		}
@@ -213,23 +378,23 @@ static void LTTBFinalize(Vector &state_vector, AggregateInputData &, Vector &res
 	auto list_entries = FlatVector::GetData<list_entry_t>(result);
 	auto &child_vector = ListVector::GetEntry(result);
 	auto &struct_entries = StructVector::GetEntries(child_vector);
-	auto x_output = FlatVector::GetData<double>(*struct_entries[0]);
-	auto y_output = FlatVector::GetData<double>(*struct_entries[1]);
+	auto &x_child = *struct_entries[0];
+	auto &y_child = *struct_entries[1];
+	const auto &x_type = x_child.GetType();
+	const auto &y_type = y_child.GetType();
 
 	idx_t total_size = ListVector::GetListSize(result);
 	for (idx_t row = 0; row < count; row++) {
 		auto &state = *states[state_data.sel->get_index(row)];
 		auto sampled = state.has_buckets && state.points ? Downsample(*state.points, state.buckets) : std::vector<LTTBPoint>();
 		ListVector::Reserve(result, total_size + sampled.size());
-		x_output = FlatVector::GetData<double>(*struct_entries[0]);
-		y_output = FlatVector::GetData<double>(*struct_entries[1]);
 
 		auto &entry = list_entries[row + offset];
 		entry.offset = total_size;
 		entry.length = sampled.size();
 		for (idx_t i = 0; i < sampled.size(); i++) {
-			x_output[total_size + i] = sampled[i].x;
-			y_output[total_size + i] = sampled[i].y;
+			WriteFromDouble(x_child, total_size + i, sampled[i].x, x_type);
+			WriteFromDouble(y_child, total_size + i, sampled[i].y, y_type);
 		}
 		total_size += sampled.size();
 	}
@@ -247,15 +412,18 @@ static void LTTBDestroy(Vector &state_vector, AggregateInputData &, idx_t count)
 	}
 }
 
-static LogicalType LTTBReturnType() {
+// Preserve both x and y types in the output for full type fidelity, matching
+// ClickHouse Array(Tuple(typed_x, typed_y)) semantics.
+static LogicalType LTTBReturnType(const LogicalType &x_type, const LogicalType &y_type) {
 	child_list_t<LogicalType> struct_children;
-	struct_children.emplace_back("x", LogicalType::DOUBLE);
-	struct_children.emplace_back("y", LogicalType::DOUBLE);
+	struct_children.emplace_back("x", x_type);
+	struct_children.emplace_back("y", y_type);
 	return LogicalType::LIST(LogicalType::STRUCT(std::move(struct_children)));
 }
 
-static AggregateFunction GetLTTBConcreteFunction(const string &name) {
-	return AggregateFunction(name, {LogicalType::DOUBLE, LogicalType::DOUBLE, LogicalType::BIGINT}, LTTBReturnType(),
+static AggregateFunction GetLTTBConcreteFunction(const string &name, const LogicalType &x_type,
+                                                 const LogicalType &y_type) {
+	return AggregateFunction(name, {x_type, y_type, LogicalType::BIGINT}, LTTBReturnType(x_type, y_type),
 	                         LTTBStateSize, LTTBInitialize, LTTBUpdate, LTTBCombine, LTTBFinalize,
 	                         FunctionNullHandling::SPECIAL_HANDLING, nullptr, nullptr, LTTBDestroy);
 }
@@ -268,12 +436,22 @@ static unique_ptr<FunctionData> LTTBBindFunction(ClientContext &, AggregateFunct
 		}
 	}
 
-	function = GetLTTBConcreteFunction(function.name);
+	const auto &x_type = arguments[0]->return_type;
+	const auto &y_type = arguments[1]->return_type;
+	// SQLNULL (untyped NULL literal) coerces to DOUBLE for backward compatibility.
+	const auto &x_resolved = x_type.id() == LogicalTypeId::SQLNULL ? LogicalType::DOUBLE : x_type;
+	const auto &y_resolved = y_type.id() == LogicalTypeId::SQLNULL ? LogicalType::DOUBLE : y_type;
+	if (!IsLTTBSupportedType(x_resolved) || !IsLTTBSupportedType(y_resolved)) {
+		throw InvalidInputException(
+		    "lttb requires numeric or temporal x/y types; got x=%s, y=%s", x_type.ToString(), y_type.ToString());
+	}
+
+	function = GetLTTBConcreteFunction(function.name, x_resolved, y_resolved);
 	return nullptr;
 }
 
 static AggregateFunction GetLTTBFunction(const string &name) {
-	return AggregateFunction(name, {LogicalType::ANY, LogicalType::ANY, LogicalType::BIGINT}, LTTBReturnType(), nullptr,
+	return AggregateFunction(name, {LogicalType::ANY, LogicalType::ANY, LogicalType::BIGINT}, LogicalType::ANY, nullptr,
 	                         nullptr, nullptr, nullptr, nullptr, nullptr, LTTBBindFunction, nullptr);
 }
 

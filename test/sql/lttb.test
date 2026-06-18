@@ -205,3 +205,82 @@ statement error
 SELECT lttb(1.0, 1.0, -1);
 ----
 lttb bucket count must be non-negative
+
+# Type-preserving input/output: direct temporal types without manual epoch().
+
+statement ok
+CREATE TABLE lttb_ts_input(x TIMESTAMP, y DOUBLE);
+
+statement ok
+INSERT INTO lttb_ts_input VALUES
+    ('2023-01-01 00:00:00', 10.0), ('2023-02-01 00:00:00', 20.0),
+    ('2023-03-01 00:00:00', 15.0), ('2023-06-01 00:00:00', 40.0),
+    ('2023-09-01 00:00:00', 35.0);
+
+query I
+SELECT list_transform(lttb(x, y, 3), lambda p: format('({}, {})', strftime(p.x, '%Y-%m-%d'), p.y)) FROM lttb_ts_input;
+----
+['(2023-01-01, 10.0)', '(2023-06-01, 40.0)', '(2023-09-01, 35.0)']
+
+statement ok
+CREATE TABLE lttb_date_input(x DATE, y DOUBLE);
+
+statement ok
+INSERT INTO lttb_date_input VALUES
+    ('2023-01-01', 10.0), ('2023-02-01', 20.0), ('2023-03-01', 15.0);
+
+query I
+SELECT list_transform(lttb(x, y, 3), lambda p: format('({}, {})', p.x, p.y)) FROM lttb_date_input;
+----
+['(2023-01-01, 10.0)', '(2023-02-01, 20.0)', '(2023-03-01, 15.0)']
+
+# Asymmetric x/y types: DATE x, SMALLINT y.
+query I
+SELECT list_transform(lttb(x, y, 3), lambda p: format('({}, {})', p.x, p.y)) FROM (VALUES (DATE '2023-01-01', 10::SMALLINT), (DATE '2023-02-01', 20::SMALLINT), (DATE '2023-03-01', 15::SMALLINT)) AS t(x, y);
+----
+['(2023-01-01, 10)', '(2023-02-01, 20)', '(2023-03-01, 15)']
+
+# TIMESTAMPTZ is physically identical to TIMESTAMP (micros).
+query I
+SELECT list_transform(lttb(x, y, 2), lambda p: format('({}, {})', strftime(p.x, '%Y-%m-%d'), p.y)) FROM (VALUES (TIMESTAMPTZ '2023-01-01 00:00:00', 10.0), (TIMESTAMPTZ '2023-06-01 00:00:00', 20.0)) AS t(x, y);
+----
+['(2023-01-01, 10.0)', '(2023-06-01, 20.0)']
+
+# TIMESTAMP_NS round-trip.
+query I
+SELECT list_transform(lttb(x, y, 2), lambda p: format('({}, {})', strftime(p.x, '%Y-%m-%d'), p.y)) FROM (VALUES (TIMESTAMP_NS '2023-01-01 00:00:00', 10.0), (TIMESTAMP_NS '2023-06-01 00:00:00', 20.0)) AS t(x, y);
+----
+['(2023-01-01, 10.0)', '(2023-06-01, 20.0)']
+
+# GROUP BY with typed x.
+query II rowsort
+SELECT g, list_transform(lttb(x, y, 2), lambda p: format('({}, {})', p.x, p.y))
+FROM (VALUES (1, DATE '2023-01-01', 10.0), (1, DATE '2023-02-01', 20.0), (2, DATE '2023-03-01', 30.0), (2, DATE '2023-04-01', 40.0)) AS t(g, x, y)
+GROUP BY g;
+----
+1	['(2023-01-01, 10.0)', '(2023-02-01, 20.0)']
+2	['(2023-03-01, 30.0)', '(2023-04-01, 40.0)']
+
+# Typed NULL input.
+query I
+SELECT list_transform(lttb(NULL::DATE, 1.0, 1), lambda p: format('({}, {})', p.x, p.y));
+----
+[]
+
+# Empty result with typed input (n=0).
+query I
+SELECT list_transform(lttb(x, y, 0), lambda p: format('({}, {})', p.x, p.y)) FROM (VALUES (TIMESTAMP '2023-01-01 00:00:00', 10.0)) AS t(x, y);
+----
+[]
+
+# Unsupported type rejection.
+statement error
+SELECT lttb('hello'::VARCHAR, 1.0, 1);
+----
+lttb requires numeric or temporal x/y types
+
+statement ok
+DROP TABLE lttb_ts_input;
+
+statement ok
+DROP TABLE lttb_date_input;
