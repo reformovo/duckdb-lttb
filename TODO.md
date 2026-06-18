@@ -102,6 +102,10 @@ operate on doubles internally; type conversion happens at I/O boundaries.
     LTTB over the reduced candidate set.
   - Document that this is approximate, not exact LTTB.
   - Re-evaluate priority to P1 if users report hitting the `1 << 30` point guard.
+  - Status: design only — not yet implemented. The two-stage approach (min-max
+    preselection then LTTB) is well-understood from the plotly-resampler
+    reference. Implementation would require a new aggregate function with a
+    different state layout (per-bucket min/max instead of all points).
 
 ## P3: Code Quality, Simplify, and Readability
 
@@ -137,11 +141,14 @@ operate on doubles internally; type conversion happens at I/O boundaries.
 
 ## P3: Tests, Benchmarks, and Docs
 
-- [ ] Add more SQLLogicTests
-  - Direct `DATE` / `TIMESTAMP` once implemented.
+- [x] Add more SQLLogicTests
+  - Direct `DATE` / `TIMESTAMP` / `TIMESTAMPTZ` / `TIMESTAMP_S` / `TIMESTAMP_MS` /
+    `TIMESTAMP_NS` input (P0 tests).
   - Duplicate `x` with `n < input_size`.
-  - Parallel/group combine behavior.
-  - Large `n`, zero `n`, all invalid values, Inf input.
+  - Parallel/group combine behavior (3-group test).
+  - Large `n` (n > input size), zero `n`, all invalid values, Inf input.
+  - `lttb_sorted` and `lttb_indices` function tests.
+  - Total: 99 assertions, all pass.
 
 - [ ] Add benchmarks
   - Include 100K and 1M point single-series benchmarks.
