@@ -45,7 +45,7 @@ def run_duckdb_extension(duckdb_bin, extension_path, size, n_out, sorted_input=T
         )
 
     sql = (
-        f".timer on\n"
+        ".timer on\n"
         f"LOAD '{extension_path}';\n"
         f"{table_sql}\n"
         f"SELECT count(*) FROM (SELECT unnest({func}(x, y, {n_out})) FROM b);\n"
@@ -76,7 +76,7 @@ def run_duckdb_extension_sorted(duckdb_bin, extension_path, size, n_out):
     """Run lttb_sorted (skip sort) via CLI."""
     table_sql = f"CREATE TABLE b AS SELECT i::DOUBLE AS x, sin(i/{size}.0)::DOUBLE AS y FROM range({size}) AS t(i);"
     sql = (
-        f".timer on\n"
+        ".timer on\n"
         f"LOAD '{extension_path}';\n"
         f"{table_sql}\n"
         f"SELECT count(*) FROM (SELECT unnest(lttb_sorted(x, y, {n_out})) FROM b);\n"
@@ -114,7 +114,7 @@ def run_python_lttb(con, size, n_out, sorted_input=True):
         start = time.perf_counter()
         data = con.execute(query).fetchall()
         arr = np.array(data, dtype=float)
-        result = lttb.downsample(arr, n_out=n_out)
+        lttb.downsample(arr, n_out=n_out)
         elapsed = time.perf_counter() - start
         times.append(elapsed)
 
@@ -132,7 +132,7 @@ def run_python_lttb_no_sort(con, size, n_out):
         data = con.execute(query).fetchall()
         arr = np.array(data, dtype=float)
         # lttb requires strictly increasing x; range() guarantees this
-        result = lttb.downsample(arr, n_out=n_out)
+        lttb.downsample(arr, n_out=n_out)
         elapsed = time.perf_counter() - start
         times.append(elapsed)
 
@@ -172,11 +172,11 @@ def main():
     print("=" * 80)
     print(f"DuckDB CLI:      {duckdb_bin}")
     print(f"Extension:        {extension_path}")
-    print(f"Python lttb:      0.3.2")
+    print("Python lttb:      0.3.2")
     print(f"Python duckdb:    {duckdb.__version__}")
     print(f"NumPy:            {np.__version__}")
     print(f"Date:             {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}")
-    print(f"Method:           best of 5 runs (excluding first cold start)")
+    print("Method:           best of 5 runs (excluding first cold start)")
     print()
 
     con = duckdb.connect()
