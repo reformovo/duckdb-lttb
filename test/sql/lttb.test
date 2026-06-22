@@ -375,3 +375,53 @@ query I
 SELECT list_transform(lttb(x, y, 2), lambda p: format('({}, {})', p.x::VARCHAR, p.y::VARCHAR)) FROM (VALUES (1::HUGEINT, 10.0), (5::HUGEINT, 50.0)) AS t(x, y);
 ----
 ['(1, 10.0)', '(5, 50.0)']
+
+# minmax_lttb: two-stage MinMax preselection + LTTB.
+# On small input (n/ratio <= n_out), degenerates to standard LTTB.
+query I
+SELECT list_transform(minmax_lttb(x, y, 4, 4), lambda p: format('({}, {})', p.x::BIGINT, p.y::BIGINT)) FROM (VALUES (1.0, 10.0), (2.0, 20.0), (3.0, 15.0), (8.0, 60.0), (9.0, 55.0), (10.0, 70.0), (4.0, 30.0), (5.0, 40.0), (6.0, 35.0), (7.0, 50.0)) AS t(x, y);
+----
+['(1, 10)', '(3, 15)', '(9, 55)', '(10, 70)']
+
+# minmax_lttb with NULL ratio uses default 4. On 100 sine-wave points, selects
+# extrema (min/max of y) via the MinMax preselect stage.
+query I
+SELECT list_transform(minmax_lttb(x, y, 5, NULL), lambda p: format('({}, {})', p.x::BIGINT, p.y::BIGINT)) FROM (SELECT i::DOUBLE AS x, sin(i)::DOUBLE AS y FROM range(100) AS t(i));
+----
+['(0, 0)', '(27, 1)', '(36, -1)', '(77, 1)', '(99, -1)']
+
+# minmax_lttb with n=0 returns empty.
+query I
+SELECT list_transform(minmax_lttb(x, y, 0, 4), lambda p: format('({}, {})', p.x::BIGINT, p.y::BIGINT)) FROM (VALUES (1.0, 10.0), (2.0, 20.0)) AS t(x, y);
+----
+[]
+
+# minmax_lttb with n >= input returns all sorted points.
+query I
+SELECT list_transform(minmax_lttb(x, y, 100, 4), lambda p: format('({}, {})', p.x::BIGINT, p.y::BIGINT)) FROM (VALUES (3.0, 30.0), (1.0, 10.0), (2.0, 20.0)) AS t(x, y);
+----
+['(1, 10)', '(2, 20)', '(3, 30)']
+
+# minmax_lttb ratio <= 1 is rejected.
+statement error
+SELECT minmax_lttb(1.0, 1.0, 5, 1);
+----
+minmax_lttb minmax_ratio must be greater than 1
+
+# minmax_lttb negative n is rejected.
+statement error
+SELECT minmax_lttb(1.0, 1.0, -1, 4);
+----
+minmax_lttb bucket count must be non-negative
+
+# minmax_lttb ratio must be constant within group.
+statement error
+SELECT minmax_lttb(x, y, 5, CASE WHEN x = 1 THEN 4 ELSE 8 END::BIGINT) FROM (VALUES (1.0, 10.0), (2.0, 20.0)) AS t(x, y);
+----
+minmax_lttb minmax_ratio must be constant within each aggregate group
+
+# minmax_lttb preserves input types (TIMESTAMP x).
+query I
+SELECT list_transform(minmax_lttb(x, y, 2, 4), lambda p: format('({}, {})', strftime(p.x, '%Y-%m-%d'), p.y)) FROM (VALUES (TIMESTAMP '2023-01-01 00:00:00', 10.0), (TIMESTAMP '2023-06-01 00:00:00', 20.0)) AS t(x, y);
+----
+['(2023-01-01, 10.0)', '(2023-06-01, 20.0)']

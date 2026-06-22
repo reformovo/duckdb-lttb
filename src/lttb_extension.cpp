@@ -730,6 +730,321 @@ static AggregateFunction GetLTTBIndicesFunction(const string &name) {
 	                         nullptr, nullptr, nullptr, nullptr, nullptr, LTTBIndicesBindFunction, nullptr);
 }
 
+// ---------------------------------------------------------------------------
+// minmax_lttb: two-stage MinMax preselection + LTTB.
+//
+// Reference: plotly-resampler MinMaxLTTB / tsdownsample minmaxlttb_generic.
+// Stage 1 (MinMax preselect): divide interior points into n_minmax_buckets
+//   equi-width x-range bins; per bin keep argmin(y) and argmax(y). Bins with
+//   <=2 points keep all. First/last points of the whole series are preserved.
+// Stage 2: run LTTB over the reduced candidate set.
+//
+// NOTE: In DuckDB's aggregate model, all points are accumulated in Update
+// (O(n) memory) — there is NO memory win vs standard LTTB. The win is compute:
+// the LTTB triangle loop runs on ~n*minmax_ratio candidates instead of n.
+// ---------------------------------------------------------------------------
+
+// MinMax preselection: from a sorted points vector, build a candidate set of
+// indices by keeping argmin(y)/argmax(y) per equi-width x-range bin. First and
+// last points are always included. Returns candidate indices into `points`.
+static std::vector<idx_t> MinMaxPreselect(const std::vector<LTTBPoint> &points, uint64_t n_minmax_buckets) {
+	const auto n = points.size();
+	if (n <= 2) {
+		std::vector<idx_t> result;
+		result.reserve(n);
+		for (idx_t i = 0; i < n; i++) {
+			result.push_back(i);
+		}
+		return result;
+	}
+
+	// n_minmax_buckets is the number of MinMax bins over the interior points.
+	// Each bin contributes up to 2 candidates (argmin/argmax of y).
+	std::vector<idx_t> candidates;
+	candidates.push_back(0); // always keep first
+
+	const double x_min = points[0].x;
+	const double x_max = points[n - 1].x;
+	const double x_range = x_max - x_min;
+	const idx_t interior_start = 1;
+	const idx_t interior_end = n - 1; // exclusive
+
+	if (x_range <= 0.0 || n_minmax_buckets == 0) {
+		// Degenerate: x all equal or no bins — keep all interior points.
+		for (idx_t i = interior_start; i < interior_end; i++) {
+			candidates.push_back(i);
+		}
+		candidates.push_back(n - 1);
+		return candidates;
+	}
+
+	const double x_step = x_range / static_cast<double>(n_minmax_buckets);
+	idx_t bin_start = interior_start;
+	for (uint64_t bin = 0; bin < n_minmax_buckets; bin++) {
+		const double bin_left = x_min + static_cast<double>(bin) * x_step;
+		const double bin_right = x_min + static_cast<double>(bin + 1) * x_step;
+		// Find [bin_start, bin_end) where x in [bin_left, bin_right).
+		// Points are sorted by x; advance bin_start to first point >= bin_left.
+		while (bin_start < interior_end && points[bin_start].x < bin_left) {
+			bin_start++;
+		}
+		idx_t bin_end = bin_start;
+		while (bin_end < interior_end && points[bin_end].x < bin_right) {
+			bin_end++;
+		}
+		if (bin_end <= bin_start) {
+			continue; // empty bin
+		}
+		const auto bin_count = bin_end - bin_start;
+		if (bin_count <= 2) {
+			// Keep all points in small bins.
+			for (idx_t i = bin_start; i < bin_end; i++) {
+				candidates.push_back(i);
+			}
+		} else {
+			// Find argmin and argmax of y within [bin_start, bin_end).
+			idx_t min_idx = bin_start;
+			idx_t max_idx = bin_start;
+			double min_y = points[bin_start].y;
+			double max_y = points[bin_start].y;
+			for (idx_t i = bin_start + 1; i < bin_end; i++) {
+				const double y = points[i].y;
+				if (y < min_y) {
+					min_y = y;
+					min_idx = i;
+				}
+				if (y > max_y) {
+					max_y = y;
+					max_idx = i;
+				}
+			}
+			// Push in sorted order (min_idx and max_idx may be in either order).
+			if (min_idx <= max_idx) {
+				candidates.push_back(min_idx);
+				candidates.push_back(max_idx);
+			} else {
+				candidates.push_back(max_idx);
+				candidates.push_back(min_idx);
+			}
+		}
+		bin_start = bin_end;
+	}
+
+	candidates.push_back(n - 1); // always keep last
+	return candidates;
+}
+
+// Bind data for minmax_lttb: carries sorted flag, default minmax_ratio, and
+// the bind-time-resolved read/write function pointers.
+struct MinMaxLTTBFunctionData : public FunctionData {
+	MinMaxLTTBFunctionData(bool sorted_p, int64_t minmax_ratio_p, ReadFunc x_read_p, ReadFunc y_read_p,
+	                        WriteFunc x_write_p, WriteFunc y_write_p)
+	    : sorted(sorted_p), minmax_ratio(minmax_ratio_p), x_read(x_read_p), y_read(y_read_p), x_write(x_write_p),
+	      y_write(y_write_p) {
+	}
+
+	bool sorted;
+	int64_t minmax_ratio; // default ratio when the 4th arg is NULL; >1 required
+	ReadFunc x_read;
+	ReadFunc y_read;
+	WriteFunc x_write;
+	WriteFunc y_write;
+
+	unique_ptr<FunctionData> Copy() const override {
+		return make_uniq<MinMaxLTTBFunctionData>(*this);
+	}
+
+	bool Equals(const FunctionData &other_p) const override {
+		auto &other = other_p.Cast<MinMaxLTTBFunctionData>();
+		return sorted == other.sorted && minmax_ratio == other.minmax_ratio;
+	}
+};
+
+static void MinMaxLTTBUpdate(Vector inputs[], AggregateInputData &input_data, idx_t input_count,
+                             Vector &state_vector, idx_t count) {
+	D_ASSERT(input_count == 4);
+
+	UnifiedVectorFormat state_data;
+	state_vector.ToUnifiedFormat(count, state_data);
+	auto states = UnifiedVectorFormat::GetData<LTTBState *>(state_data);
+
+	UnifiedVectorFormat x_data, y_data, buckets_data, ratio_data;
+	inputs[0].ToUnifiedFormat(count, x_data);
+	inputs[1].ToUnifiedFormat(count, y_data);
+	inputs[2].ToUnifiedFormat(count, buckets_data);
+	inputs[3].ToUnifiedFormat(count, ratio_data);
+	auto buckets_values = UnifiedVectorFormat::GetData<int64_t>(buckets_data);
+	auto ratio_values = UnifiedVectorFormat::GetData<int64_t>(ratio_data);
+
+	auto &bind_data = input_data.bind_data->Cast<MinMaxLTTBFunctionData>();
+	const auto x_read = bind_data.x_read;
+	const auto y_read = bind_data.y_read;
+	const auto &x_type = inputs[0].GetType();
+	const auto &y_type = inputs[1].GetType();
+	const int64_t default_ratio = bind_data.minmax_ratio;
+
+	for (idx_t row = 0; row < count; row++) {
+		const auto x_index = x_data.sel->get_index(row);
+		const auto y_index = y_data.sel->get_index(row);
+		const auto buckets_index = buckets_data.sel->get_index(row);
+		const auto ratio_index = ratio_data.sel->get_index(row);
+		if (!x_data.validity.RowIsValid(x_index) || !y_data.validity.RowIsValid(y_index) ||
+		    !buckets_data.validity.RowIsValid(buckets_index)) {
+			continue;
+		}
+		// minmax_ratio arg may be NULL → use the bind-time default.
+		int64_t minmax_ratio = default_ratio;
+		if (ratio_data.validity.RowIsValid(ratio_index)) {
+			minmax_ratio = ratio_values[ratio_index];
+		}
+
+		auto &state = *states[state_data.sel->get_index(row)];
+		const auto buckets_input = buckets_values[buckets_index];
+		if (buckets_input < 0) {
+			throw InvalidInputException("minmax_lttb bucket count must be non-negative");
+		}
+		if (minmax_ratio <= 1) {
+			throw InvalidInputException("minmax_lttb minmax_ratio must be greater than 1");
+		}
+		const auto buckets = static_cast<uint64_t>(buckets_input);
+		if (!state.has_buckets) {
+			state.buckets = buckets;
+			state.has_buckets = true;
+			// Repurpose the unused `buckets` field is not enough for two params;
+			// encode minmax_ratio in the upper 32 bits of buckets (ratio <= 2^31).
+			state.buckets = (buckets & 0xFFFFFFFFULL) | (static_cast<uint64_t>(minmax_ratio) << 32);
+		} else {
+			const auto stored_buckets = state.buckets & 0xFFFFFFFFULL;
+			const auto stored_ratio = static_cast<int64_t>(state.buckets >> 32);
+			if (stored_buckets != buckets) {
+				throw InvalidInputException("minmax_lttb bucket count must be constant within each aggregate group");
+			}
+			if (stored_ratio != minmax_ratio) {
+				throw InvalidInputException("minmax_lttb minmax_ratio must be constant within each aggregate group");
+			}
+		}
+
+		const auto x = x_read(x_data, row, x_type);
+		const auto y = y_read(y_data, row, y_type);
+		if (!IsValidPoint(x, y)) {
+			continue;
+		}
+		if (!state.points) {
+			state.points = new std::vector<LTTBPoint>();
+			state.points->reserve(256);
+		}
+		if (state.points->size() >= MAX_LTTB_POINTS) {
+			throw InvalidInputException("minmax_lttb aggregate state exceeded maximum point count of " +
+			                            std::to_string(MAX_LTTB_POINTS));
+		}
+		state.points->push_back({x, y});
+	}
+}
+
+static void MinMaxLTTBFinalize(Vector &state_vector, AggregateInputData &input_data, Vector &result, idx_t count,
+                               idx_t offset) {
+	UnifiedVectorFormat state_data;
+	state_vector.ToUnifiedFormat(count, state_data);
+	auto states = UnifiedVectorFormat::GetData<LTTBState *>(state_data);
+	auto list_entries = FlatVector::GetData<list_entry_t>(result);
+	auto &child_vector = ListVector::GetEntry(result);
+	auto &struct_entries = StructVector::GetEntries(child_vector);
+	auto &x_child = *struct_entries[0];
+	auto &y_child = *struct_entries[1];
+	const auto &x_type = x_child.GetType();
+	const auto &y_type = y_child.GetType();
+
+	auto &bind_data = input_data.bind_data->Cast<MinMaxLTTBFunctionData>();
+	const bool skip_sort = bind_data.sorted;
+	const auto x_write = bind_data.x_write;
+	const auto y_write = bind_data.y_write;
+
+	idx_t total_size = ListVector::GetListSize(result);
+	for (idx_t row = 0; row < count; row++) {
+		auto &state = *states[state_data.sel->get_index(row)];
+		std::vector<LTTBPoint> sampled;
+		if (state.has_buckets && state.points) {
+			const auto n_out = static_cast<uint64_t>(state.buckets & 0xFFFFFFFFULL);
+			const auto minmax_ratio = static_cast<int64_t>(state.buckets >> 32);
+			auto &points = *state.points;
+			// Sort if not pre-sorted.
+			if (!skip_sort) {
+				std::stable_sort(points.begin(), points.end(),
+				                 [](const LTTBPoint &lhs, const LTTBPoint &rhs) { return lhs.x < rhs.x; });
+			}
+			const auto n = points.size();
+			// Degenerate cases: n_out=0 → empty; n_out>=n → all; ratio<=1 or
+			// n/ratio<=n_out → standard LTTB (no preselect).
+			if (n_out == 0) {
+				sampled = {};
+			} else if (n <= n_out) {
+				sampled = std::move(points);
+			} else if (minmax_ratio <= 1 || n / static_cast<uint64_t>(minmax_ratio) <= n_out) {
+				sampled = Downsample(points, n_out, true); // already sorted
+			} else {
+				// Stage 1: MinMax preselect.
+				const auto n_minmax_buckets = (n_out * static_cast<uint64_t>(minmax_ratio)) / 2;
+				auto candidate_indices = MinMaxPreselect(points, n_minmax_buckets);
+				// Stage 2: LTTB on the candidate set.
+				std::vector<LTTBPoint> candidates;
+				candidates.reserve(candidate_indices.size());
+				for (auto idx : candidate_indices) {
+					candidates.push_back(points[idx]);
+				}
+				sampled = Downsample(candidates, n_out, true); // candidates already sorted by x
+			}
+		}
+		ListVector::Reserve(result, total_size + sampled.size());
+
+		auto &entry = list_entries[row + offset];
+		entry.offset = total_size;
+		entry.length = sampled.size();
+		for (idx_t i = 0; i < sampled.size(); i++) {
+			x_write(x_child, total_size + i, sampled[i].x, x_type);
+			y_write(y_child, total_size + i, sampled[i].y, y_type);
+		}
+		total_size += sampled.size();
+	}
+	ListVector::SetListSize(result, total_size);
+}
+
+static AggregateFunction GetMinMaxLTTBConcreteFunction(const string &name, const LogicalType &x_type,
+                                                       const LogicalType &y_type) {
+	return AggregateFunction(name, {x_type, y_type, LogicalType::BIGINT, LogicalType::BIGINT},
+	                         LTTBReturnType(x_type, y_type), LTTBStateSize, LTTBInitialize, MinMaxLTTBUpdate,
+	                         LTTBCombine, MinMaxLTTBFinalize, FunctionNullHandling::SPECIAL_HANDLING, nullptr, nullptr,
+	                         LTTBDestroy);
+}
+
+static unique_ptr<FunctionData> MinMaxLTTBBindFunction(ClientContext &, AggregateFunction &function,
+                                                       vector<unique_ptr<Expression>> &arguments) {
+	for (auto &argument : arguments) {
+		if (argument->return_type.id() == LogicalTypeId::UNKNOWN) {
+			throw ParameterNotResolvedException();
+		}
+	}
+
+	const auto &x_type = arguments[0]->return_type;
+	const auto &y_type = arguments[1]->return_type;
+	const auto &x_resolved = x_type.id() == LogicalTypeId::SQLNULL ? LogicalType::DOUBLE : x_type;
+	const auto &y_resolved = y_type.id() == LogicalTypeId::SQLNULL ? LogicalType::DOUBLE : y_type;
+	if (!IsLTTBSupportedType(x_resolved) || !IsLTTBSupportedType(y_resolved)) {
+		throw InvalidInputException(
+		    "minmax_lttb requires numeric or temporal x/y types; got x=%s, y=%s", x_type.ToString(), y_type.ToString());
+	}
+
+	function = GetMinMaxLTTBConcreteFunction(function.name, x_resolved, y_resolved);
+	// Default minmax_ratio = 4 (matches plotly-resampler MinMaxLTTB default).
+	return make_uniq<MinMaxLTTBFunctionData>(false, 4, MakeReader(x_resolved), MakeReader(y_resolved),
+	                                          MakeWriter(x_resolved), MakeWriter(y_resolved));
+}
+
+static AggregateFunction GetMinMaxLTTBFunction(const string &name) {
+	return AggregateFunction(name, {LogicalType::ANY, LogicalType::ANY, LogicalType::BIGINT, LogicalType::BIGINT},
+	                         LogicalType::ANY, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+	                         MinMaxLTTBBindFunction, nullptr);
+}
+
 } // namespace
 
 static void LoadInternal(ExtensionLoader &loader) {
@@ -739,6 +1054,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(GetLTTBSortedFunction("lttb_sorted"));
 	// Indices output: returns BIGINT[] of selected sorted-position indices.
 	loader.RegisterFunction(GetLTTBIndicesFunction("lttb_indices"));
+	// MinMax preselection + LTTB for large inputs (compute win, no memory win).
+	loader.RegisterFunction(GetMinMaxLTTBFunction("minmax_lttb"));
 }
 
 void LttbExtension::Load(ExtensionLoader &loader) {
