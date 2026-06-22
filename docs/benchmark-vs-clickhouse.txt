@@ -1,0 +1,51 @@
+ClickHouse version: 25.7.1.3997
+================================================================================
+Benchmark: DuckDB lttb extension vs ClickHouse largestTriangleThreeBuckets
+================================================================================
+DuckDB CLI:       ./build/release/duckdb
+Extension:        ./build/release/extension/lttb/lttb.duckdb_extension
+ClickHouse:       swanlab-clickhouse (v25.7.1.3997)
+Date:             2026-06-22 05:16:54 UTC
+Method:           best of 5 runs
+
+Dataset                 n_out    DuckDB (ms) ClickHouse (ms)      Ratio
+...................... ...... .............. .............. ..........
+------------------------------------------------------------------------------------------------
+10K sorted                100            1.0            2.0       .50x
+10K sorted               1000            1.0            2.0       .50x
+10K sorted              10000            1.0            2.0       .50x
+100K sorted               100            2.0            3.0       .66x
+100K sorted              1000            2.0            3.0       .66x
+100K sorted             10000            2.0            3.0       .66x
+1000K sorted              100           16.0           17.0       .94x
+1000K sorted             1000           16.0           16.0      1.00x
+1000K sorted            10000           16.0           17.0       .94x
+
+Dataset                 n_out    DuckDB (ms) ClickHouse (ms)      Ratio
+...................... ...... .............. .............. ..........
+------------------------------------------------------------------------------------------------
+10K shuffled             1000            1.0            2.0       .50x
+100K shuffled            1000            6.0            8.0       .75x
+1000K shuffled           1000           71.0           77.0       .92x
+
+Dataset                 n_out    DuckDB (ms) ClickHouse (ms)      Ratio
+...................... ...... .............. .............. ..........
+------------------------------------------------------------------------------------------------
+100K TIMESTAMP           1000            2.0            3.0       .66x
+1000K TIMESTAMP          1000           16.0           17.0       .94x
+
+Dataset                 n_out    DuckDB (ms) ClickHouse (ms)      Ratio
+...................... ...... .............. .............. ..........
+------------------------------------------------------------------------------------------------
+100K 100groups            100            1.0            4.0       .25x
+1000K 100groups           100           12.0           22.0       .54x
+
+================================================================================
+Notes:
+  - Ratio = DuckDB / ClickHouse. <1.0 means DuckDB is faster.
+  - Both use native C++ aggregate functions (no Python overhead).
+  - DuckDB runs via CLI subprocess; ClickHouse via container exec.
+  - Both include process startup + query execution in the timing.
+  - ClickHouse runs inside a Linux container (Apple Virtualization Framework).
+  - DuckDB runs natively on macOS (arm64).
+================================================================================
