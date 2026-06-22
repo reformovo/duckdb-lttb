@@ -1045,6 +1045,299 @@ static AggregateFunction GetMinMaxLTTBFunction(const string &name) {
 	                         MinMaxLTTBBindFunction, nullptr);
 }
 
+// ---------------------------------------------------------------------------
+// bucket_stats: per-bucket statistical downsampling for AI agent analysis.
+//
+// bucket_stats(x, y, num_buckets) → STRUCT(bucket_start, bucket_end, count,
+// min, max, mean, std, first, last)[]
+//
+// Stats are over y only; x provides bucket range boundaries (bucket_start,
+// bucket_end). Equal-count-by-index bucketing (same formula as LTTB). First
+// and last points of the whole series are in the boundary buckets. Population
+// std (divide by N, not N-1). min/max/first/last preserve y_type; mean/std
+// are DOUBLE.
+// ---------------------------------------------------------------------------
+
+struct BucketStatsFunctionData : public FunctionData {
+	BucketStatsFunctionData(ReadFunc x_read_p, ReadFunc y_read_p, WriteFunc x_write_p, WriteFunc y_write_p)
+	    : x_read(x_read_p), y_read(y_read_p), x_write(x_write_p), y_write(y_write_p) {
+	}
+
+	ReadFunc x_read;
+	ReadFunc y_read;
+	WriteFunc x_write;
+	WriteFunc y_write;
+
+	unique_ptr<FunctionData> Copy() const override {
+		return make_uniq<BucketStatsFunctionData>(*this);
+	}
+
+	bool Equals(const FunctionData &other_p) const override {
+		auto &other = other_p.Cast<BucketStatsFunctionData>();
+		return x_read == other.x_read && y_read == other.y_read;
+	}
+};
+
+static void BucketStatsUpdate(Vector inputs[], AggregateInputData &input_data, idx_t input_count,
+                              Vector &state_vector, idx_t count) {
+	D_ASSERT(input_count == 3);
+
+	UnifiedVectorFormat state_data;
+	state_vector.ToUnifiedFormat(count, state_data);
+	auto states = UnifiedVectorFormat::GetData<LTTBState *>(state_data);
+
+	UnifiedVectorFormat x_data, y_data, buckets_data;
+	inputs[0].ToUnifiedFormat(count, x_data);
+	inputs[1].ToUnifiedFormat(count, y_data);
+	inputs[2].ToUnifiedFormat(count, buckets_data);
+	auto buckets_values = UnifiedVectorFormat::GetData<int64_t>(buckets_data);
+
+	auto &bind_data = input_data.bind_data->Cast<BucketStatsFunctionData>();
+	const auto x_read = bind_data.x_read;
+	const auto y_read = bind_data.y_read;
+	const auto &x_type = inputs[0].GetType();
+	const auto &y_type = inputs[1].GetType();
+
+	for (idx_t row = 0; row < count; row++) {
+		const auto x_index = x_data.sel->get_index(row);
+		const auto y_index = y_data.sel->get_index(row);
+		const auto buckets_index = buckets_data.sel->get_index(row);
+		if (!x_data.validity.RowIsValid(x_index) || !y_data.validity.RowIsValid(y_index) ||
+		    !buckets_data.validity.RowIsValid(buckets_index)) {
+			continue;
+		}
+
+		auto &state = *states[state_data.sel->get_index(row)];
+		const auto buckets_input = buckets_values[buckets_index];
+		if (buckets_input < 0) {
+			throw InvalidInputException("bucket_stats bucket count must be non-negative");
+		}
+		const auto buckets = static_cast<uint64_t>(buckets_input);
+		if (!state.has_buckets) {
+			state.buckets = buckets;
+			state.has_buckets = true;
+		} else if (state.buckets != buckets) {
+			throw InvalidInputException("bucket_stats bucket count must be constant within each aggregate group");
+		}
+
+		const auto x = x_read(x_data, row, x_type);
+		const auto y = y_read(y_data, row, y_type);
+		if (!IsValidPoint(x, y)) {
+			continue;
+		}
+		if (!state.points) {
+			state.points = new std::vector<LTTBPoint>();
+			state.points->reserve(256);
+		}
+		if (state.points->size() >= MAX_LTTB_POINTS) {
+			throw InvalidInputException("bucket_stats aggregate state exceeded maximum point count of " +
+			                            std::to_string(MAX_LTTB_POINTS));
+		}
+		state.points->push_back({x, y});
+	}
+}
+
+static LogicalType BucketStatsReturnType(const LogicalType &x_type, const LogicalType &y_type) {
+	child_list_t<LogicalType> struct_children;
+	struct_children.emplace_back("bucket_start", x_type);
+	struct_children.emplace_back("bucket_end", x_type);
+	struct_children.emplace_back("count", LogicalType::BIGINT);
+	struct_children.emplace_back("min", y_type);
+	struct_children.emplace_back("max", y_type);
+	struct_children.emplace_back("mean", LogicalType::DOUBLE);
+	struct_children.emplace_back("std", LogicalType::DOUBLE);
+	struct_children.emplace_back("first", y_type);
+	struct_children.emplace_back("last", y_type);
+	return LogicalType::LIST(LogicalType::STRUCT(std::move(struct_children)));
+}
+
+static void BucketStatsFinalize(Vector &state_vector, AggregateInputData &input_data, Vector &result, idx_t count,
+                                idx_t offset) {
+	UnifiedVectorFormat state_data;
+	state_vector.ToUnifiedFormat(count, state_data);
+	auto states = UnifiedVectorFormat::GetData<LTTBState *>(state_data);
+	auto list_entries = FlatVector::GetData<list_entry_t>(result);
+	auto &child_vector = ListVector::GetEntry(result);
+	auto &struct_entries = StructVector::GetEntries(child_vector);
+	// Struct children: bucket_start, bucket_end, count, min, max, mean, std, first, last
+	auto &bucket_start_child = *struct_entries[0];
+	auto &bucket_end_child = *struct_entries[1];
+	auto &count_child = *struct_entries[2];
+	auto &min_child = *struct_entries[3];
+	auto &max_child = *struct_entries[4];
+	auto &mean_child = *struct_entries[5];
+	auto &std_child = *struct_entries[6];
+	auto &first_child = *struct_entries[7];
+	auto &last_child = *struct_entries[8];
+	const auto &x_type = bucket_start_child.GetType();
+	const auto &y_type = min_child.GetType();
+
+	auto &bind_data = input_data.bind_data->Cast<BucketStatsFunctionData>();
+	const auto x_write = bind_data.x_write;
+	const auto y_write = bind_data.y_write;
+
+	idx_t total_size = ListVector::GetListSize(result);
+	for (idx_t row = 0; row < count; row++) {
+		auto &state = *states[state_data.sel->get_index(row)];
+		if (state.has_buckets && state.points) {
+			auto &points = *state.points;
+			// Stable sort by x (bucket_stats does not have a sorted variant).
+			std::stable_sort(points.begin(), points.end(),
+			                 [](const LTTBPoint &lhs, const LTTBPoint &rhs) { return lhs.x < rhs.x; });
+			const auto n = points.size();
+			const auto num_buckets = state.buckets;
+
+			if (num_buckets == 0) {
+				// empty — fall through to empty entry below.
+			} else if (n <= num_buckets) {
+				// Each point is its own bucket (count=1, std=0).
+				ListVector::Reserve(result, total_size + n);
+				for (idx_t i = 0; i < n; i++) {
+					x_write(bucket_start_child, total_size, points[i].x, x_type);
+					x_write(bucket_end_child, total_size, points[i].x, x_type);
+					FlatVector::GetData<int64_t>(count_child)[total_size] = 1;
+					y_write(min_child, total_size, points[i].y, y_type);
+					y_write(max_child, total_size, points[i].y, y_type);
+					FlatVector::GetData<double>(mean_child)[total_size] = points[i].y;
+					FlatVector::GetData<double>(std_child)[total_size] = 0.0;
+					y_write(first_child, total_size, points[i].y, y_type);
+					y_write(last_child, total_size, points[i].y, y_type);
+					total_size += 1;
+				}
+				auto &entry = list_entries[row + offset];
+				entry.offset = total_size - n;
+				entry.length = n;
+				ListVector::SetListSize(result, total_size);
+				continue;
+			} else if (num_buckets == 1) {
+				// Single bucket: all points.
+				double min_y = points[0].y, max_y = points[0].y;
+				double first_y = points[0].y, last_y = points[n - 1].y;
+				double sum = 0, sum_sq = 0;
+				for (idx_t i = 0; i < n; i++) {
+					const double y = points[i].y;
+					min_y = MinValue(min_y, y);
+					max_y = MaxValue(max_y, y);
+					sum += y;
+					sum_sq += y * y;
+				}
+				const double mean = sum / static_cast<double>(n);
+				const double variance = sum_sq / static_cast<double>(n) - mean * mean;
+				const double std = std::sqrt(std::max(0.0, variance));
+				// Write as a single struct entry.
+				ListVector::Reserve(result, total_size + 1);
+				x_write(bucket_start_child, total_size, points[0].x, x_type);
+				x_write(bucket_end_child, total_size, points[n - 1].x, x_type);
+				FlatVector::GetData<int64_t>(count_child)[total_size] = static_cast<int64_t>(n);
+				y_write(min_child, total_size, min_y, y_type);
+				y_write(max_child, total_size, max_y, y_type);
+				FlatVector::GetData<double>(mean_child)[total_size] = mean;
+				FlatVector::GetData<double>(std_child)[total_size] = std;
+				y_write(first_child, total_size, first_y, y_type);
+				y_write(last_child, total_size, last_y, y_type);
+				auto &entry = list_entries[row + offset];
+				entry.offset = total_size;
+				entry.length = 1;
+				total_size += 1;
+				ListVector::SetListSize(result, total_size);
+				continue;
+			} else {
+				// Equal-count-by-index bucketing (LTTB formula).
+				// First and last points are singletons; interior divided into
+				// num_buckets-2 buckets of width (n-2)/(num_buckets-2).
+				const double bucket_width = static_cast<double>(n - 2) / static_cast<double>(num_buckets - 2);
+				for (uint64_t bucket = 0; bucket < num_buckets; bucket++) {
+					idx_t b_start, b_end;
+					if (bucket == 0) {
+						b_start = 0;
+						b_end = 1;
+					} else if (bucket == num_buckets - 1) {
+						b_start = n - 1;
+						b_end = n;
+					} else {
+						b_start = static_cast<idx_t>(std::floor(static_cast<double>(bucket - 1) * bucket_width)) + 1;
+						b_end = MinValue<idx_t>(
+						    static_cast<idx_t>(std::floor(static_cast<double>(bucket) * bucket_width)) + 1, n - 1);
+					}
+					const auto b_count = b_end - b_start;
+					if (b_count == 0) {
+						continue;
+					}
+					double min_y = points[b_start].y, max_y = points[b_start].y;
+					double first_y = points[b_start].y, last_y = points[b_end - 1].y;
+					double sum = 0, sum_sq = 0;
+					for (idx_t i = b_start; i < b_end; i++) {
+						const double y = points[i].y;
+						min_y = MinValue(min_y, y);
+						max_y = MaxValue(max_y, y);
+						sum += y;
+						sum_sq += y * y;
+					}
+					const double mean = sum / static_cast<double>(b_count);
+					const double variance = sum_sq / static_cast<double>(b_count) - mean * mean;
+					const double std_val = std::sqrt(std::max(0.0, variance));
+
+					ListVector::Reserve(result, total_size + 1);
+					x_write(bucket_start_child, total_size, points[b_start].x, x_type);
+					x_write(bucket_end_child, total_size, points[b_end - 1].x, x_type);
+					FlatVector::GetData<int64_t>(count_child)[total_size] = static_cast<int64_t>(b_count);
+					y_write(min_child, total_size, min_y, y_type);
+					y_write(max_child, total_size, max_y, y_type);
+					FlatVector::GetData<double>(mean_child)[total_size] = mean;
+					FlatVector::GetData<double>(std_child)[total_size] = std_val;
+					y_write(first_child, total_size, first_y, y_type);
+					y_write(last_child, total_size, last_y, y_type);
+					total_size += 1;
+				}
+				auto &entry = list_entries[row + offset];
+				entry.offset = total_size - num_buckets;
+				entry.length = num_buckets;
+				ListVector::SetListSize(result, total_size);
+				continue;
+			}
+		}
+		// Empty or no state.
+		auto &entry = list_entries[row + offset];
+		entry.offset = total_size;
+		entry.length = 0;
+	}
+	ListVector::SetListSize(result, total_size);
+}
+
+static AggregateFunction GetBucketStatsConcreteFunction(const string &name, const LogicalType &x_type,
+                                                        const LogicalType &y_type) {
+	return AggregateFunction(name, {x_type, y_type, LogicalType::BIGINT}, BucketStatsReturnType(x_type, y_type),
+	                         LTTBStateSize, LTTBInitialize, BucketStatsUpdate, LTTBCombine, BucketStatsFinalize,
+	                         FunctionNullHandling::SPECIAL_HANDLING, nullptr, nullptr, LTTBDestroy);
+}
+
+static unique_ptr<FunctionData> BucketStatsBindFunction(ClientContext &, AggregateFunction &function,
+                                                        vector<unique_ptr<Expression>> &arguments) {
+	for (auto &argument : arguments) {
+		if (argument->return_type.id() == LogicalTypeId::UNKNOWN) {
+			throw ParameterNotResolvedException();
+		}
+	}
+
+	const auto &x_type = arguments[0]->return_type;
+	const auto &y_type = arguments[1]->return_type;
+	const auto &x_resolved = x_type.id() == LogicalTypeId::SQLNULL ? LogicalType::DOUBLE : x_type;
+	const auto &y_resolved = y_type.id() == LogicalTypeId::SQLNULL ? LogicalType::DOUBLE : y_type;
+	if (!IsLTTBSupportedType(x_resolved) || !IsLTTBSupportedType(y_resolved)) {
+		throw InvalidInputException(
+		    "bucket_stats requires numeric or temporal x/y types; got x=%s, y=%s", x_type.ToString(), y_type.ToString());
+	}
+
+	function = GetBucketStatsConcreteFunction(function.name, x_resolved, y_resolved);
+	return make_uniq<BucketStatsFunctionData>(MakeReader(x_resolved), MakeReader(y_resolved),
+	                                           MakeWriter(x_resolved), MakeWriter(y_resolved));
+}
+
+static AggregateFunction GetBucketStatsFunction(const string &name) {
+	return AggregateFunction(name, {LogicalType::ANY, LogicalType::ANY, LogicalType::BIGINT}, LogicalType::ANY, nullptr,
+	                         nullptr, nullptr, nullptr, nullptr, nullptr, BucketStatsBindFunction, nullptr);
+}
+
 } // namespace
 
 static void LoadInternal(ExtensionLoader &loader) {
@@ -1056,6 +1349,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(GetLTTBIndicesFunction("lttb_indices"));
 	// MinMax preselection + LTTB for large inputs (compute win, no memory win).
 	loader.RegisterFunction(GetMinMaxLTTBFunction("minmax_lttb"));
+	// Per-bucket statistical downsampling for AI agent distribution analysis.
+	loader.RegisterFunction(GetBucketStatsFunction("bucket_stats"));
 }
 
 void LttbExtension::Load(ExtensionLoader &loader) {

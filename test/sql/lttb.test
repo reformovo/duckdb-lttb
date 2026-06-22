@@ -425,3 +425,42 @@ query I
 SELECT list_transform(minmax_lttb(x, y, 2, 4), lambda p: format('({}, {})', strftime(p.x, '%Y-%m-%d'), p.y)) FROM (VALUES (TIMESTAMP '2023-01-01 00:00:00', 10.0), (TIMESTAMP '2023-06-01 00:00:00', 20.0)) AS t(x, y);
 ----
 ['(2023-01-01, 10.0)', '(2023-06-01, 20.0)']
+
+# bucket_stats: per-bucket statistical downsampling. Stats over y only; x
+# provides bucket range boundaries. Equal-count-by-index bucketing. Population
+# std (divide by N). 3 buckets on 6 points: first singleton, 4 interior, last
+# singleton.
+query I
+SELECT list_transform(bucket_stats(x, y, 3), lambda b: format('({}, {}, {}, {}, {}, {:.2f}, {:.2f}, {}, {})', b.bucket_start::BIGINT, b.bucket_end::BIGINT, b.count, b.min::BIGINT, b.max::BIGINT, b.mean, b.std, b.first::BIGINT, b.last::BIGINT)) FROM (VALUES (1.0, 10.0), (2.0, 20.0), (3.0, 15.0), (4.0, 30.0), (5.0, 40.0), (6.0, 35.0)) AS t(x, y);
+----
+['(1, 1, 1, 10, 10, 10.00, 0.00, 10, 10)', '(2, 5, 4, 15, 40, 26.25, 9.60, 20, 40)', '(6, 6, 1, 35, 35, 35.00, 0.00, 35, 35)']
+
+# bucket_stats with n=0 returns empty.
+query I
+SELECT list_transform(bucket_stats(x, y, 0), lambda b: b.count::VARCHAR) FROM (VALUES (1.0, 10.0), (2.0, 20.0)) AS t(x, y);
+----
+[]
+
+# bucket_stats with n=1: single bucket with all points.
+query I
+SELECT list_transform(bucket_stats(x, y, 1), lambda b: format('({}, {}, {}, {:.1f}, {:.1f})', b.bucket_start::BIGINT, b.bucket_end::BIGINT, b.count, b.mean, b.std)) FROM (VALUES (1.0, 10.0), (2.0, 20.0), (3.0, 15.0)) AS t(x, y);
+----
+['(1, 3, 3, 15.0, 4.1)']
+
+# bucket_stats with n >= input: each point its own bucket.
+query I
+SELECT list_transform(bucket_stats(x, y, 100), lambda b: b.count::VARCHAR) FROM (VALUES (3.0, 30.0), (1.0, 10.0), (2.0, 20.0)) AS t(x, y);
+----
+[1, 1, 1]
+
+# bucket_stats negative n is rejected.
+statement error
+SELECT bucket_stats(1.0, 1.0, -1);
+----
+bucket_stats bucket count must be non-negative
+
+# bucket_stats preserves input types (TIMESTAMP x, DOUBLE y).
+query I
+SELECT list_transform(bucket_stats(x, y, 3), lambda b: format('({}, {}, {}, {:.1f})', strftime(b.bucket_start, '%Y-%m-%d'), strftime(b.bucket_end, '%Y-%m-%d'), b.count, b.mean)) FROM (VALUES (TIMESTAMP '2023-01-01 00:00:00', 10.0), (TIMESTAMP '2023-06-01 00:00:00', 20.0), (TIMESTAMP '2023-12-01 00:00:00', 15.0)) AS t(x, y);
+----
+['(2023-01-01, 2023-01-01, 1, 10.0)', '(2023-06-01, 2023-06-01, 1, 20.0)', '(2023-12-01, 2023-12-01, 1, 15.0)']
