@@ -1,0 +1,55 @@
+================================================================================
+Three-Way Benchmark: DuckDB lttb vs ClickHouse vs Python lttb
+================================================================================
+DuckDB:     ./build/release/duckdb (extension: ./build/release/extension/lttb/lttb.duckdb_extension)
+ClickHouse: swanlab-clickhouse (v25.7.1.3997)
+Python:     lttb 0.3.2 + duckdb 1.4.5 + numpy 1.26.4
+Date:       2026-06-22 05:20:37 UTC
+Method:     best of 5 runs
+Notes:      DuckDB timing includes CLI subprocess startup.
+            ClickHouse timing is server-side (--time, excludes connection).
+            Python timing is in-process (perf_counter, includes fetch+downsample).
+
+=== Section 1: Sorted DOUBLE input ===
+
+Dataset             n_out   DuckDB(ms)   ClickH(ms)   Python(ms)    DuckDB/CH
+................   ...... ............ ............ ............ ............
+--------------------------------------------------------------------------------------------------------
+10K                   100          0.0          2.0          3.1           0x
+10K                  1000          1.0          2.0          9.8         .50x
+10K                 10000          1.0          2.0          2.2         .50x
+100K                  100          2.0          3.0         25.6         .66x
+100K                 1000          2.0          3.0         31.5         .66x
+100K                10000          2.0          3.0         95.6         .66x
+1000K                 100         17.0         19.0        239.9         .89x
+1000K                1000         16.0         18.0        247.9         .88x
+1000K               10000         16.0         19.0        311.8         .84x
+
+=== Section 2: Shuffled input (sort cost) ===
+
+Dataset             n_out   DuckDB(ms)   ClickH(ms)  Python(ms)*
+................   ...... ............ ............ ............
+------------------------------------------------------------------------------------------------
+(* Python cannot handle shuffled input; uses sorted data for fair comparison)
+10K shuf             1000          1.0          2.0          9.9
+100K shuf            1000          6.0          8.0         31.6
+1000K shuf           1000         74.0         85.0        244.5
+
+=== Section 3: TIMESTAMP / DateTime input ===
+
+Dataset             n_out   DuckDB(ms)   ClickH(ms)   Python(ms)
+................   ...... ............ ............ ............
+------------------------------------------------------------------------------------------------
+100K TS              1000          2.0          3.0         31.7
+1000K TS             1000         16.0         17.0        254.7
+
+=== Section 4: Multi-group (100 groups) ===
+
+Dataset             n_out   DuckDB(ms)   ClickH(ms)
+................   ...... ............ ............
+------------------------------------------------------------------------------------------------
+(Python lttb has no GROUP BY aggregate; excluded from this section)
+100K 100grp           100          2.0          4.0
+1000K 100grp          100         12.0         21.0
+
+================================================================================
