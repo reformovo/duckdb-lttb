@@ -151,12 +151,12 @@ operate on doubles internally; type conversion happens at I/O boundaries.
   - Total: 99 assertions, all pass.
 
 - [x] Add benchmarks
-  - Added `scripts/benchmark_three_way.sh` — a shell script that compares
+  - Added `scripts/benchmark.sh` — a shell script that compares
     DuckDB lttb, ClickHouse largestTriangleThreeBuckets, and Python lttb
     on the same datasets.
   - Covers: sorted DOUBLE input (10K/100K/1M, n=100/1000/10000), shuffled
     input (sort cost), TIMESTAMP/DateTime input, multi-group (100 groups).
-  - Results and analysis documented in `docs/benchmark-comparison.md`.
+  - Results and analysis documented in `docs/benchmark.md`.
   - Key findings (1M points, n=1000, sorted input):
     - DuckDB: 16ms, ClickHouse: 18ms, Python: 248ms
     - DuckDB fastest in all scenarios; ClickHouse close 2nd; Python 15x slower
