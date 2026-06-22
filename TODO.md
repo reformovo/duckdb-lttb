@@ -37,21 +37,25 @@ operate on doubles internally; type conversion happens at I/O boundaries.
 
 ## P1: Correctness Fixes (from @oracle review)
 
-- [ ] Check `Hugeint::TryCast` / `Uhugeint::TryCast` / `TryConvert` return values
+- [x] Check `Hugeint::TryCast` / `Uhugeint::TryCast` / `TryConvert` return values
   - **Issue**: `ReadAsDouble` (lines 84-93, 129-132) and `WriteFromDouble`
     (lines 176-178, 225-227) call `Hugeint::TryCast` / `TryConvert` without
     checking the boolean return value. An out-of-double-range HUGEINT would
     silently produce 0.0 instead of an error or Inf.
-  - **Fix**: Check return value, throw `InternalException` on failure.
+  - **Fix**: Check return value, throw `InvalidInputException` on failure.
+    (`InvalidInputException` instead of `InternalException` so the error is
+    testable via SQLLogicTest — `statement error` rejects internal errors.)
   - **Severity**: Medium (defensive programming; extremely rare in practice).
   - **Impact on PulseOn**: None (PulseOn uses step BIGINT, not HUGEINT x axis).
 
-- [ ] Add `D_ASSERT` / `std::clamp` for DECIMAL int16 write-back
+- [x] Add `D_ASSERT` / `std::clamp` for DECIMAL int16 write-back
   - **Issue**: `WriteFromDouble` line 215 does
     `static_cast<int16_t>(scaled)` where `scaled` is `int64_t`. If the rounded
     value exceeds `int16_t` range, this is implementation-defined behavior in
     C++17.
-  - **Fix**: Add `D_ASSERT(scaled >= std::numeric_limits<int16_t>::min() && scaled <= std::numeric_limits<int16_t>::max())` or use `std::clamp`.
+  - **Fix**: Clamp `scaled` to int16/int32 range via `MaxValue`/`MinValue`
+    (DuckDB helpers, since `std::clamp` is unavailable in this toolchain).
+    Applied to int16 and int32; int64 needs no clamp (already int64_t).
   - **Severity**: Low (LTTB only selects from existing input values; overflow
     requires boundary DECIMAL values + double round-trip ULP jitter).
   - **Impact on PulseOn**: None (PulseOn uses DOUBLE/FLOAT metric values).
@@ -129,14 +133,14 @@ operate on doubles internally; type conversion happens at I/O boundaries.
   - **Priority**: High — PulseOn's `get_metric_digest()` is an agent hot path;
     cumulative savings across many queries are significant.
 
-- [ ] DECIMAL divisor/multiplier lookup table
+- [x] DECIMAL divisor/multiplier lookup table
   - **Issue**: `for (uint8_t i = 0; i < scale; i++) divisor *= 10.0` (lines
     117-119, 209-211) runs per Update call. Scale is typically 2-4, so cost is
     negligible, but for scale=38 it's 38 multiplications per row.
   - **Optimization**: Use a static `constexpr double POW10[]` lookup table
     indexed by scale (max 38 for DuckDB DECIMAL).
   - **Priority**: Low — trivial code change, near-zero runtime impact for
-    typical use. Do it as a cleanup.
+    typical use. Done as cleanup.
 
 - [ ] SIMD acceleration for triangle area inner loop
   - **Issue**: The bucket candidate loop (lines 354-362) computes triangle
