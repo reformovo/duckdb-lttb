@@ -120,16 +120,16 @@ operate on doubles internally; type conversion happens at I/O boundaries.
 
 ## P1: Performance Optimizations (from @oracle review)
 
-- [ ] Hoist `ReadAsDouble` type dispatch outside the Update row loop
+- [x] Hoist `ReadAsDouble` type dispatch outside the Update row loop
   - **Issue**: `ReadAsDouble(x_data, row, x_type)` is called inside the row
     loop (line 429), executing a `switch (type.id())` dispatch per row. For 1M
     rows, this is 2M switch dispatches (x + y per row).
   - **Optimization**: Resolve the type dispatch at bind time into function
-    pointers (`ReadFunc`), call directly in the loop. Expected 6-12% throughput
-    improvement on sorted 1M input (16ms → ~14ms).
-  - **Implementation**: Generate `ReadFunc` instances per supported type (20+
-    types). Use macro or template expansion. Store in `LTTBFunctionData` or a
-    new bind-data struct.
+    pointers (`ReadFunc`/`WriteFunc`), call directly in the loop. Expected 6-12%
+    throughput improvement on sorted 1M input (16ms → ~14ms).
+  - **Implementation**: `MakeReader`/`MakeWriter` resolve type-specific bare
+    function pointers at bind; stored in `LTTBFunctionData` (x_read, y_read,
+    x_write, y_write). Update/Finalize call them directly per row.
   - **Priority**: High — PulseOn's `get_metric_digest()` is an agent hot path;
     cumulative savings across many queries are significant.
 
