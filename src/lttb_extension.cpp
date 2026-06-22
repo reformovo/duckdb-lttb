@@ -42,12 +42,27 @@ struct LTTBState {
 	bool has_buckets = false;
 };
 
-// Bind data carrying whether the caller guarantees pre-sorted input (lttb_sorted).
+// Type-dispatched read/write function pointers. Resolved once at bind time so
+// the per-row Update/Finalize loops call a single indirect function instead of
+// a 20-case switch on type.id() per row.
+// NOTE: These are bare function pointers (trivially copyable, no stateful
+// captures) so LTTBFunctionData::Copy() remains correct. Do not replace with
+// std::function or stateful lambdas.
+using ReadFunc = double (*)(const UnifiedVectorFormat &, idx_t, const LogicalType &);
+using WriteFunc = void (*)(Vector &, idx_t, double, const LogicalType &);
+
+// Bind data carrying whether the caller guarantees pre-sorted input (lttb_sorted)
+// and the bind-time-resolved read/write function pointers for x and y.
 struct LTTBFunctionData : public FunctionData {
-	explicit LTTBFunctionData(bool sorted_p) : sorted(sorted_p) {
+	LTTBFunctionData(bool sorted_p, ReadFunc x_read_p, ReadFunc y_read_p, WriteFunc x_write_p, WriteFunc y_write_p)
+	    : sorted(sorted_p), x_read(x_read_p), y_read(y_read_p), x_write(x_write_p), y_write(y_write_p) {
 	}
 
 	bool sorted;
+	ReadFunc x_read;
+	ReadFunc y_read;
+	WriteFunc x_write;
+	WriteFunc y_write;
 
 	unique_ptr<FunctionData> Copy() const override {
 		return make_uniq<LTTBFunctionData>(*this);
@@ -55,7 +70,8 @@ struct LTTBFunctionData : public FunctionData {
 
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<LTTBFunctionData>();
-		return sorted == other.sorted;
+		return sorted == other.sorted && x_read == other.x_read && y_read == other.y_read &&
+		       x_write == other.x_write && y_write == other.y_write;
 	}
 };
 
@@ -63,199 +79,229 @@ static bool IsValidPoint(double x, double y) {
 	return !std::isnan(x) && !std::isnan(y);
 }
 
-// Read a value of the given logical type from a unified-format vector at row_idx
-// and convert it to double for the LTTB algorithm. The conversion is monotonic
-// for every supported type (numeric, date, timestamp), so sorting on the
-// resulting doubles preserves the correct ordering of the original typed values.
-static double ReadAsDouble(const UnifiedVectorFormat &data, idx_t row_idx, const LogicalType &type) {
-	const auto idx = data.sel->get_index(row_idx);
-	// Caller is responsible for the validity check; this helper assumes a valid row.
+// Resolve the type-specific read function at bind time. The returned function
+// pointer captures the type dispatch so the per-row loop avoids a 20-case
+// switch. DECIMAL still reads scale from the LogicalType (an inline accessor,
+// not a dispatch).
+static ReadFunc MakeReader(const LogicalType &type) {
 	switch (type.id()) {
 	case LogicalTypeId::DOUBLE:
-		return UnifiedVectorFormat::GetData<double>(data)[idx];
+		return [](const UnifiedVectorFormat &d, idx_t r, const LogicalType &) {
+			return UnifiedVectorFormat::GetData<double>(d)[d.sel->get_index(r)];
+		};
 	case LogicalTypeId::FLOAT:
-		return static_cast<double>(UnifiedVectorFormat::GetData<float>(data)[idx]);
+		return [](const UnifiedVectorFormat &d, idx_t r, const LogicalType &) {
+			return static_cast<double>(UnifiedVectorFormat::GetData<float>(d)[d.sel->get_index(r)]);
+		};
 	case LogicalTypeId::TINYINT:
-		return static_cast<double>(UnifiedVectorFormat::GetData<int8_t>(data)[idx]);
+		return [](const UnifiedVectorFormat &d, idx_t r, const LogicalType &) {
+			return static_cast<double>(UnifiedVectorFormat::GetData<int8_t>(d)[d.sel->get_index(r)]);
+		};
 	case LogicalTypeId::SMALLINT:
-		return static_cast<double>(UnifiedVectorFormat::GetData<int16_t>(data)[idx]);
+		return [](const UnifiedVectorFormat &d, idx_t r, const LogicalType &) {
+			return static_cast<double>(UnifiedVectorFormat::GetData<int16_t>(d)[d.sel->get_index(r)]);
+		};
 	case LogicalTypeId::INTEGER:
-		return static_cast<double>(UnifiedVectorFormat::GetData<int32_t>(data)[idx]);
+		return [](const UnifiedVectorFormat &d, idx_t r, const LogicalType &) {
+			return static_cast<double>(UnifiedVectorFormat::GetData<int32_t>(d)[d.sel->get_index(r)]);
+		};
 	case LogicalTypeId::BIGINT:
-		return static_cast<double>(UnifiedVectorFormat::GetData<int64_t>(data)[idx]);
+		return [](const UnifiedVectorFormat &d, idx_t r, const LogicalType &) {
+			return static_cast<double>(UnifiedVectorFormat::GetData<int64_t>(d)[d.sel->get_index(r)]);
+		};
 	case LogicalTypeId::UTINYINT:
-		return static_cast<double>(UnifiedVectorFormat::GetData<uint8_t>(data)[idx]);
+		return [](const UnifiedVectorFormat &d, idx_t r, const LogicalType &) {
+			return static_cast<double>(UnifiedVectorFormat::GetData<uint8_t>(d)[d.sel->get_index(r)]);
+		};
 	case LogicalTypeId::USMALLINT:
-		return static_cast<double>(UnifiedVectorFormat::GetData<uint16_t>(data)[idx]);
+		return [](const UnifiedVectorFormat &d, idx_t r, const LogicalType &) {
+			return static_cast<double>(UnifiedVectorFormat::GetData<uint16_t>(d)[d.sel->get_index(r)]);
+		};
 	case LogicalTypeId::UINTEGER:
-		return static_cast<double>(UnifiedVectorFormat::GetData<uint32_t>(data)[idx]);
+		return [](const UnifiedVectorFormat &d, idx_t r, const LogicalType &) {
+			return static_cast<double>(UnifiedVectorFormat::GetData<uint32_t>(d)[d.sel->get_index(r)]);
+		};
 	case LogicalTypeId::UBIGINT:
-		return static_cast<double>(UnifiedVectorFormat::GetData<uint64_t>(data)[idx]);
-	case LogicalTypeId::HUGEINT: {
-		double result = 0;
-		const auto value = UnifiedVectorFormat::GetData<hugeint_t>(data)[idx];
-		if (!Hugeint::TryCast(value, result)) {
-			throw InvalidInputException("lttb: HUGEINT value out of double range: %s", value.ToString());
-		}
-		return result;
-	}
-	case LogicalTypeId::UHUGEINT: {
-		double result = 0;
-		const auto value = UnifiedVectorFormat::GetData<uhugeint_t>(data)[idx];
-		if (!Uhugeint::TryCast(value, result)) {
-			throw InvalidInputException("lttb: UHUGEINT value out of double range: %s", value.ToString());
-		}
-		return result;
-	}
+		return [](const UnifiedVectorFormat &d, idx_t r, const LogicalType &) {
+			return static_cast<double>(UnifiedVectorFormat::GetData<uint64_t>(d)[d.sel->get_index(r)]);
+		};
+	case LogicalTypeId::HUGEINT:
+		return [](const UnifiedVectorFormat &d, idx_t r, const LogicalType &) {
+			const auto idx = d.sel->get_index(r);
+			double result = 0;
+			const auto value = UnifiedVectorFormat::GetData<hugeint_t>(d)[idx];
+			if (!Hugeint::TryCast(value, result)) {
+				throw InvalidInputException("lttb: HUGEINT value out of double range: %s", value.ToString());
+			}
+			return result;
+		};
+	case LogicalTypeId::UHUGEINT:
+		return [](const UnifiedVectorFormat &d, idx_t r, const LogicalType &) {
+			const auto idx = d.sel->get_index(r);
+			double result = 0;
+			const auto value = UnifiedVectorFormat::GetData<uhugeint_t>(d)[idx];
+			if (!Uhugeint::TryCast(value, result)) {
+				throw InvalidInputException("lttb: UHUGEINT value out of double range: %s", value.ToString());
+			}
+			return result;
+		};
 	case LogicalTypeId::DATE:
-		// date_t is days since 1970-01-01; lossless double round-trip.
-		return static_cast<double>(Date::EpochDays(UnifiedVectorFormat::GetData<date_t>(data)[idx]));
+		return [](const UnifiedVectorFormat &d, idx_t r, const LogicalType &) {
+			return static_cast<double>(
+			    Date::EpochDays(UnifiedVectorFormat::GetData<date_t>(d)[d.sel->get_index(r)]));
+		};
 	case LogicalTypeId::TIMESTAMP:
 	case LogicalTypeId::TIMESTAMP_TZ:
-		// timestamp_t / timestamp_tz_t hold microseconds since epoch; losslessly
-		// representable in a double (53-bit mantissa) for all practical dates
-		// (until ~2250 CE).
-		return static_cast<double>(Timestamp::GetEpochMicroSeconds(
-		    UnifiedVectorFormat::GetData<timestamp_t>(data)[idx]));
+		return [](const UnifiedVectorFormat &d, idx_t r, const LogicalType &) {
+			return static_cast<double>(Timestamp::GetEpochMicroSeconds(
+			    UnifiedVectorFormat::GetData<timestamp_t>(d)[d.sel->get_index(r)]));
+		};
 	case LogicalTypeId::TIMESTAMP_SEC:
-		// timestamp_sec_t holds seconds since epoch directly.
-		return static_cast<double>(UnifiedVectorFormat::GetData<timestamp_sec_t>(data)[idx].value);
+		return [](const UnifiedVectorFormat &d, idx_t r, const LogicalType &) {
+			return static_cast<double>(UnifiedVectorFormat::GetData<timestamp_sec_t>(d)[d.sel->get_index(r)].value);
+		};
 	case LogicalTypeId::TIMESTAMP_MS:
-		// timestamp_ms_t holds milliseconds since epoch directly.
-		return static_cast<double>(UnifiedVectorFormat::GetData<timestamp_ms_t>(data)[idx].value);
+		return [](const UnifiedVectorFormat &d, idx_t r, const LogicalType &) {
+			return static_cast<double>(UnifiedVectorFormat::GetData<timestamp_ms_t>(d)[d.sel->get_index(r)].value);
+		};
 	case LogicalTypeId::TIMESTAMP_NS:
-		// timestamp_ns_t holds nanoseconds since epoch directly.
-		return static_cast<double>(UnifiedVectorFormat::GetData<timestamp_ns_t>(data)[idx].value);
-	case LogicalTypeId::DECIMAL: {
-		// Round-trip through double is lossy for DECIMALs with >15 significant
-		// digits. Acceptable for LTTB's visualization use case.
-		const auto scale = DecimalType::GetScale(type);
-		const auto divisor = POW10[scale];
-		switch (type.InternalType()) {
-		case PhysicalType::INT16:
-			return static_cast<double>(UnifiedVectorFormat::GetData<int16_t>(data)[idx]) / divisor;
-		case PhysicalType::INT32:
-			return static_cast<double>(UnifiedVectorFormat::GetData<int32_t>(data)[idx]) / divisor;
-		case PhysicalType::INT64:
-			return static_cast<double>(UnifiedVectorFormat::GetData<int64_t>(data)[idx]) / divisor;
-		default: {
-			double result = 0;
-			const auto value = UnifiedVectorFormat::GetData<hugeint_t>(data)[idx];
-			if (!Hugeint::TryCast(value, result)) {
-				throw InvalidInputException("lttb: DECIMAL value out of double range: %s", value.ToString());
+		return [](const UnifiedVectorFormat &d, idx_t r, const LogicalType &) {
+			return static_cast<double>(UnifiedVectorFormat::GetData<timestamp_ns_t>(d)[d.sel->get_index(r)].value);
+		};
+	case LogicalTypeId::DECIMAL:
+		return [](const UnifiedVectorFormat &d, idx_t r, const LogicalType &t) {
+			const auto idx = d.sel->get_index(r);
+			const auto divisor = POW10[DecimalType::GetScale(t)];
+			switch (t.InternalType()) {
+			case PhysicalType::INT16:
+				return static_cast<double>(UnifiedVectorFormat::GetData<int16_t>(d)[idx]) / divisor;
+			case PhysicalType::INT32:
+				return static_cast<double>(UnifiedVectorFormat::GetData<int32_t>(d)[idx]) / divisor;
+			case PhysicalType::INT64:
+				return static_cast<double>(UnifiedVectorFormat::GetData<int64_t>(d)[idx]) / divisor;
+			default: {
+				double result = 0;
+				const auto value = UnifiedVectorFormat::GetData<hugeint_t>(d)[idx];
+				if (!Hugeint::TryCast(value, result)) {
+					throw InvalidInputException("lttb: DECIMAL value out of double range: %s", value.ToString());
+				}
+				return result / divisor;
 			}
-			return result / divisor;
-		}
-		}
-	}
+			}
+		};
 	default:
 		throw InternalException("Unsupported LTTB input type: %s", type.ToString());
 	}
 }
 
-// Write a double value back into a flat vector at the given offset, converting
-// it to the vector's logical type. Inverse of ReadAsDouble.
-static void WriteFromDouble(Vector &vec, idx_t offset, double value, const LogicalType &type) {
+// Resolve the type-specific write function at bind time. Mirrors MakeReader.
+static WriteFunc MakeWriter(const LogicalType &type) {
 	switch (type.id()) {
 	case LogicalTypeId::DOUBLE:
-		FlatVector::GetData<double>(vec)[offset] = value;
-		break;
+		return [](Vector &v, idx_t o, double val, const LogicalType &) {
+			FlatVector::GetData<double>(v)[o] = val;
+		};
 	case LogicalTypeId::FLOAT:
-		FlatVector::GetData<float>(vec)[offset] = static_cast<float>(value);
-		break;
+		return [](Vector &v, idx_t o, double val, const LogicalType &) {
+			FlatVector::GetData<float>(v)[o] = static_cast<float>(val);
+		};
 	case LogicalTypeId::TINYINT:
-		FlatVector::GetData<int8_t>(vec)[offset] = static_cast<int8_t>(value);
-		break;
+		return [](Vector &v, idx_t o, double val, const LogicalType &) {
+			FlatVector::GetData<int8_t>(v)[o] = static_cast<int8_t>(val);
+		};
 	case LogicalTypeId::SMALLINT:
-		FlatVector::GetData<int16_t>(vec)[offset] = static_cast<int16_t>(value);
-		break;
+		return [](Vector &v, idx_t o, double val, const LogicalType &) {
+			FlatVector::GetData<int16_t>(v)[o] = static_cast<int16_t>(val);
+		};
 	case LogicalTypeId::INTEGER:
-		FlatVector::GetData<int32_t>(vec)[offset] = static_cast<int32_t>(value);
-		break;
+		return [](Vector &v, idx_t o, double val, const LogicalType &) {
+			FlatVector::GetData<int32_t>(v)[o] = static_cast<int32_t>(val);
+		};
 	case LogicalTypeId::BIGINT:
-		FlatVector::GetData<int64_t>(vec)[offset] = static_cast<int64_t>(value);
-		break;
+		return [](Vector &v, idx_t o, double val, const LogicalType &) {
+			FlatVector::GetData<int64_t>(v)[o] = static_cast<int64_t>(val);
+		};
 	case LogicalTypeId::UTINYINT:
-		FlatVector::GetData<uint8_t>(vec)[offset] = static_cast<uint8_t>(value);
-		break;
+		return [](Vector &v, idx_t o, double val, const LogicalType &) {
+			FlatVector::GetData<uint8_t>(v)[o] = static_cast<uint8_t>(val);
+		};
 	case LogicalTypeId::USMALLINT:
-		FlatVector::GetData<uint16_t>(vec)[offset] = static_cast<uint16_t>(value);
-		break;
+		return [](Vector &v, idx_t o, double val, const LogicalType &) {
+			FlatVector::GetData<uint16_t>(v)[o] = static_cast<uint16_t>(val);
+		};
 	case LogicalTypeId::UINTEGER:
-		FlatVector::GetData<uint32_t>(vec)[offset] = static_cast<uint32_t>(value);
-		break;
+		return [](Vector &v, idx_t o, double val, const LogicalType &) {
+			FlatVector::GetData<uint32_t>(v)[o] = static_cast<uint32_t>(val);
+		};
 	case LogicalTypeId::UBIGINT:
-		FlatVector::GetData<uint64_t>(vec)[offset] = static_cast<uint64_t>(value);
-		break;
-	case LogicalTypeId::HUGEINT: {
-		hugeint_t result;
-		if (!Hugeint::TryConvert(value, result)) {
-			throw InvalidInputException("lttb: double value out of HUGEINT range on write-back: %f", value);
-		}
-		FlatVector::GetData<hugeint_t>(vec)[offset] = result;
-		break;
-	}
-	case LogicalTypeId::UHUGEINT: {
-		uhugeint_t result;
-		if (!Uhugeint::TryConvert(value, result)) {
-			throw InvalidInputException("lttb: double value out of UHUGEINT range on write-back: %f", value);
-		}
-		FlatVector::GetData<uhugeint_t>(vec)[offset] = result;
-		break;
-	}
+		return [](Vector &v, idx_t o, double val, const LogicalType &) {
+			FlatVector::GetData<uint64_t>(v)[o] = static_cast<uint64_t>(val);
+		};
+	case LogicalTypeId::HUGEINT:
+		return [](Vector &v, idx_t o, double val, const LogicalType &) {
+			hugeint_t result;
+			if (!Hugeint::TryConvert(val, result)) {
+				throw InvalidInputException("lttb: double value out of HUGEINT range on write-back: %f", val);
+			}
+			FlatVector::GetData<hugeint_t>(v)[o] = result;
+		};
+	case LogicalTypeId::UHUGEINT:
+		return [](Vector &v, idx_t o, double val, const LogicalType &) {
+			uhugeint_t result;
+			if (!Uhugeint::TryConvert(val, result)) {
+				throw InvalidInputException("lttb: double value out of UHUGEINT range on write-back: %f", val);
+			}
+			FlatVector::GetData<uhugeint_t>(v)[o] = result;
+		};
 	case LogicalTypeId::DATE:
-		FlatVector::GetData<date_t>(vec)[offset] = Date::EpochDaysToDate(static_cast<int32_t>(value));
-		break;
+		return [](Vector &v, idx_t o, double val, const LogicalType &) {
+			FlatVector::GetData<date_t>(v)[o] = Date::EpochDaysToDate(static_cast<int32_t>(val));
+		};
 	case LogicalTypeId::TIMESTAMP:
 	case LogicalTypeId::TIMESTAMP_TZ:
-		FlatVector::GetData<timestamp_t>(vec)[offset] =
-		    Timestamp::FromEpochMicroSeconds(static_cast<int64_t>(value));
-		break;
+		return [](Vector &v, idx_t o, double val, const LogicalType &) {
+			FlatVector::GetData<timestamp_t>(v)[o] = Timestamp::FromEpochMicroSeconds(static_cast<int64_t>(val));
+		};
 	case LogicalTypeId::TIMESTAMP_SEC:
-		FlatVector::GetData<timestamp_sec_t>(vec)[offset] =
-		    timestamp_sec_t(static_cast<int64_t>(value));
-		break;
+		return [](Vector &v, idx_t o, double val, const LogicalType &) {
+			FlatVector::GetData<timestamp_sec_t>(v)[o] = timestamp_sec_t(static_cast<int64_t>(val));
+		};
 	case LogicalTypeId::TIMESTAMP_MS:
-		FlatVector::GetData<timestamp_ms_t>(vec)[offset] =
-		    timestamp_ms_t(static_cast<int64_t>(value));
-		break;
+		return [](Vector &v, idx_t o, double val, const LogicalType &) {
+			FlatVector::GetData<timestamp_ms_t>(v)[o] = timestamp_ms_t(static_cast<int64_t>(val));
+		};
 	case LogicalTypeId::TIMESTAMP_NS:
-		FlatVector::GetData<timestamp_ns_t>(vec)[offset] =
-		    timestamp_ns_t(static_cast<int64_t>(value));
-		break;
-	case LogicalTypeId::DECIMAL: {
-		const auto scale = DecimalType::GetScale(type);
-		const auto multiplier = POW10[scale];
-		const auto scaled = std::llround(value * multiplier);
-		// Clamp guards against implementation-defined narrowing from int64_t to
-		// the physical int type when ULP round-trip jitter pushes a boundary
-		// DECIMAL value out of range. LTTB only selects existing input values,
-		// so the clamp never alters a legitimately-selected point.
-		switch (type.InternalType()) {
-		case PhysicalType::INT16:
-			FlatVector::GetData<int16_t>(vec)[offset] = static_cast<int16_t>(
-			    MaxValue<int64_t>(MinValue<int64_t>(scaled, std::numeric_limits<int16_t>::max()),
-			                      std::numeric_limits<int16_t>::min()));
-			break;
-		case PhysicalType::INT32:
-			FlatVector::GetData<int32_t>(vec)[offset] = static_cast<int32_t>(
-			    MaxValue<int64_t>(MinValue<int64_t>(scaled, std::numeric_limits<int32_t>::max()),
-			                      std::numeric_limits<int32_t>::min()));
-			break;
-		case PhysicalType::INT64:
-			FlatVector::GetData<int64_t>(vec)[offset] = scaled;
-			break;
-		default: {
-			hugeint_t result;
-			if (!Hugeint::TryConvert(value * multiplier, result)) {
-				throw InvalidInputException("lttb: DECIMAL value out of range on write-back: %f", value);
+		return [](Vector &v, idx_t o, double val, const LogicalType &) {
+			FlatVector::GetData<timestamp_ns_t>(v)[o] = timestamp_ns_t(static_cast<int64_t>(val));
+		};
+	case LogicalTypeId::DECIMAL:
+		return [](Vector &v, idx_t o, double val, const LogicalType &t) {
+			const auto multiplier = POW10[DecimalType::GetScale(t)];
+			const auto scaled = std::llround(val * multiplier);
+			switch (t.InternalType()) {
+			case PhysicalType::INT16:
+				FlatVector::GetData<int16_t>(v)[o] = static_cast<int16_t>(
+				    MaxValue<int64_t>(MinValue<int64_t>(scaled, std::numeric_limits<int16_t>::max()),
+				                      std::numeric_limits<int16_t>::min()));
+				break;
+			case PhysicalType::INT32:
+				FlatVector::GetData<int32_t>(v)[o] = static_cast<int32_t>(
+				    MaxValue<int64_t>(MinValue<int64_t>(scaled, std::numeric_limits<int32_t>::max()),
+				                      std::numeric_limits<int32_t>::min()));
+				break;
+			case PhysicalType::INT64:
+				FlatVector::GetData<int64_t>(v)[o] = scaled;
+				break;
+			default: {
+				hugeint_t result;
+				if (!Hugeint::TryConvert(val * multiplier, result)) {
+					throw InvalidInputException("lttb: DECIMAL value out of range on write-back: %f", val);
+				}
+				FlatVector::GetData<hugeint_t>(v)[o] = result;
+				break;
 			}
-			FlatVector::GetData<hugeint_t>(vec)[offset] = result;
-			break;
-		}
-		}
-		break;
-	}
+			}
+		};
 	default:
 		throw InternalException("Unsupported LTTB output type: %s", type.ToString());
 	}
@@ -413,7 +459,8 @@ static void LTTBInitialize(const AggregateFunction &, data_ptr_t state) {
 	lttb_state.has_buckets = false;
 }
 
-static void LTTBUpdate(Vector inputs[], AggregateInputData &, idx_t input_count, Vector &state_vector, idx_t count) {
+static void LTTBUpdate(Vector inputs[], AggregateInputData &input_data, idx_t input_count, Vector &state_vector,
+                       idx_t count) {
 	D_ASSERT(input_count == 3);
 
 	UnifiedVectorFormat state_data;
@@ -428,6 +475,10 @@ static void LTTBUpdate(Vector inputs[], AggregateInputData &, idx_t input_count,
 	inputs[2].ToUnifiedFormat(count, buckets_data);
 	auto buckets_values = UnifiedVectorFormat::GetData<int64_t>(buckets_data);
 
+	// Resolve the bind-time read function pointers once (outside the row loop).
+	auto &bind_data = input_data.bind_data->Cast<LTTBFunctionData>();
+	const auto x_read = bind_data.x_read;
+	const auto y_read = bind_data.y_read;
 	const auto &x_type = inputs[0].GetType();
 	const auto &y_type = inputs[1].GetType();
 
@@ -453,8 +504,8 @@ static void LTTBUpdate(Vector inputs[], AggregateInputData &, idx_t input_count,
 			throw InvalidInputException("lttb bucket count must be constant within each aggregate group");
 		}
 
-		const auto x = ReadAsDouble(x_data, row, x_type);
-		const auto y = ReadAsDouble(y_data, row, y_type);
+		const auto x = x_read(x_data, row, x_type);
+		const auto y = y_read(y_data, row, y_type);
 		if (!IsValidPoint(x, y)) {
 			continue;
 		}
@@ -527,8 +578,11 @@ static void LTTBFinalize(Vector &state_vector, AggregateInputData &input_data, V
 	const auto &x_type = x_child.GetType();
 	const auto &y_type = y_child.GetType();
 
-	const bool skip_sort =
-	    input_data.bind_data && input_data.bind_data->Cast<LTTBFunctionData>().sorted;
+	auto &bind_data = input_data.bind_data->Cast<LTTBFunctionData>();
+	const bool skip_sort = bind_data.sorted;
+	// Resolve the bind-time write function pointers once (outside the row loop).
+	const auto x_write = bind_data.x_write;
+	const auto y_write = bind_data.y_write;
 
 	idx_t total_size = ListVector::GetListSize(result);
 	for (idx_t row = 0; row < count; row++) {
@@ -540,8 +594,8 @@ static void LTTBFinalize(Vector &state_vector, AggregateInputData &input_data, V
 		entry.offset = total_size;
 		entry.length = sampled.size();
 		for (idx_t i = 0; i < sampled.size(); i++) {
-			WriteFromDouble(x_child, total_size + i, sampled[i].x, x_type);
-			WriteFromDouble(y_child, total_size + i, sampled[i].y, y_type);
+			x_write(x_child, total_size + i, sampled[i].x, x_type);
+			y_write(y_child, total_size + i, sampled[i].y, y_type);
 		}
 		total_size += sampled.size();
 	}
@@ -640,7 +694,10 @@ static unique_ptr<FunctionData> LTTBBindFunctionImpl(ClientContext &, AggregateF
 	} else {
 		function = GetLTTBConcreteFunction(function.name, x_resolved, y_resolved);
 	}
-	return make_uniq<LTTBFunctionData>(sorted);
+	// Resolve the type-specific read/write function pointers at bind time so
+	// the per-row Update/Finalize loops avoid a 20-case switch dispatch.
+	return make_uniq<LTTBFunctionData>(sorted, MakeReader(x_resolved), MakeReader(y_resolved),
+	                                   MakeWriter(x_resolved), MakeWriter(y_resolved));
 }
 
 static unique_ptr<FunctionData> LTTBBindFunction(ClientContext &context, AggregateFunction &function,
