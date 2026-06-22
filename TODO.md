@@ -186,10 +186,11 @@ operate on doubles internally; type conversion happens at I/O boundaries.
     - `n / minmax_ratio <= n`: degenerates to standard LTTB
   - **Implementation**: Two-stage Finalize reusing LTTBState (accumulate all
     points in Update, MinMax preselect in Finalize → LTTB on candidates).
-    NOTE: NO memory win in DuckDB's aggregate model (O(n) accumulation); the
-    win is compute (LTTB triangle loop on ~n*ratio candidates instead of n).
-    Equi-width x-range bins; per bin keep argmin(y)/argmax(y); first/last
-    always preserved.
+    NOTE: NO memory win in DuckDB's aggregate model (O(n) accumulation), and
+    the candidate set is not persisted across queries. Benchmarks show no
+    clear compute win for typical batch workloads because the O(n) preselect
+    scan offsets the smaller LTTB triangle loop. Equi-width x-range bins; per
+    bin keep argmin(y)/argmax(y); first/last always preserved.
   - **Document**: This is approximate, not exact LTTB.
   - **Status**: implemented; speculative for typical batch workloads —
     benchmark post-hoc to confirm value.

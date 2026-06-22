@@ -37,7 +37,7 @@ The output preserves both `x` and `y` types: `STRUCT(x typed, y typed)[]`, match
 - `minmax_ratio` defaults to 4 (pass `NULL` for the default). `minmax_ratio <= 1` is rejected.
 - When `n / minmax_ratio <= n_out`, degenerates to standard LTTB (no preselect).
 - Both `n` and `minmax_ratio` must be constant within each aggregate group.
-- **Note**: In DuckDB's aggregate model, all points are accumulated in Update (O(n) memory) — there is no memory win vs standard LTTB. The win is compute: the LTTB triangle loop runs on ~`n * minmax_ratio` candidates instead of `n` points.
+- **Note**: In DuckDB's aggregate model, all points are accumulated in Update (O(n) memory), and the candidate set is temporary inside a single Finalize call. It is not cached across queries. Benchmarks show no clear speedup for typical batch workloads because the O(n) MinMax preselect scan offsets the smaller LTTB triangle loop.
 - Output preserves input types, matching `lttb`/`lttb_sorted`.
 
 ### bucket_stats
