@@ -360,3 +360,18 @@ DROP TABLE lttb_ts_input;
 
 statement ok
 DROP TABLE lttb_date_input;
+
+# Defensive range checks: HUGEINT values near the boundary round-trip through
+# double with ULP jitter. Max HUGEINT (170141183460469231731687303715884105727)
+# becomes 170141183460469231731687303715884105728.0 in double — one greater than
+# HUGEINT max — so TryConvert on write-back fails and throws InvalidInputException.
+statement error
+SELECT lttb(170141183460469231731687303715884105727::HUGEINT, 1.0, 1);
+----
+lttb: double value out of HUGEINT range on write-back
+
+# In-range HUGEINT round-trips correctly.
+query I
+SELECT list_transform(lttb(x, y, 2), lambda p: format('({}, {})', p.x::VARCHAR, p.y::VARCHAR)) FROM (VALUES (1::HUGEINT, 10.0), (5::HUGEINT, 50.0)) AS t(x, y);
+----
+['(1, 10.0)', '(5, 50.0)']

@@ -11,6 +11,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
@@ -20,6 +22,14 @@ namespace duckdb {
 namespace {
 
 constexpr idx_t MAX_LTTB_POINTS = 1ULL << 30;
+
+// Powers of 10 indexed by DECIMAL scale (max DuckDB DECIMAL scale is 38).
+// Used to convert between raw int storage and double for DECIMAL I/O.
+static constexpr double POW10[] = {
+    1e0,  1e1,  1e2,  1e3,  1e4,  1e5,  1e6,  1e7,  1e8,  1e9,
+    1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19,
+    1e20, 1e21, 1e22, 1e23, 1e24, 1e25, 1e26, 1e27, 1e28, 1e29,
+    1e30, 1e31, 1e32, 1e33, 1e34, 1e35, 1e36, 1e37, 1e38};
 
 struct LTTBPoint {
 	double x;
@@ -83,12 +93,18 @@ static double ReadAsDouble(const UnifiedVectorFormat &data, idx_t row_idx, const
 		return static_cast<double>(UnifiedVectorFormat::GetData<uint64_t>(data)[idx]);
 	case LogicalTypeId::HUGEINT: {
 		double result = 0;
-		Hugeint::TryCast(UnifiedVectorFormat::GetData<hugeint_t>(data)[idx], result);
+		const auto value = UnifiedVectorFormat::GetData<hugeint_t>(data)[idx];
+		if (!Hugeint::TryCast(value, result)) {
+			throw InvalidInputException("lttb: HUGEINT value out of double range: %s", value.ToString());
+		}
 		return result;
 	}
 	case LogicalTypeId::UHUGEINT: {
 		double result = 0;
-		Uhugeint::TryCast(UnifiedVectorFormat::GetData<uhugeint_t>(data)[idx], result);
+		const auto value = UnifiedVectorFormat::GetData<uhugeint_t>(data)[idx];
+		if (!Uhugeint::TryCast(value, result)) {
+			throw InvalidInputException("lttb: UHUGEINT value out of double range: %s", value.ToString());
+		}
 		return result;
 	}
 	case LogicalTypeId::DATE:
@@ -114,10 +130,7 @@ static double ReadAsDouble(const UnifiedVectorFormat &data, idx_t row_idx, const
 		// Round-trip through double is lossy for DECIMALs with >15 significant
 		// digits. Acceptable for LTTB's visualization use case.
 		const auto scale = DecimalType::GetScale(type);
-		double divisor = 1.0;
-		for (uint8_t i = 0; i < scale; i++) {
-			divisor *= 10.0;
-		}
+		const auto divisor = POW10[scale];
 		switch (type.InternalType()) {
 		case PhysicalType::INT16:
 			return static_cast<double>(UnifiedVectorFormat::GetData<int16_t>(data)[idx]) / divisor;
@@ -127,7 +140,10 @@ static double ReadAsDouble(const UnifiedVectorFormat &data, idx_t row_idx, const
 			return static_cast<double>(UnifiedVectorFormat::GetData<int64_t>(data)[idx]) / divisor;
 		default: {
 			double result = 0;
-			Hugeint::TryCast(UnifiedVectorFormat::GetData<hugeint_t>(data)[idx], result);
+			const auto value = UnifiedVectorFormat::GetData<hugeint_t>(data)[idx];
+			if (!Hugeint::TryCast(value, result)) {
+				throw InvalidInputException("lttb: DECIMAL value out of double range: %s", value.ToString());
+			}
 			return result / divisor;
 		}
 		}
@@ -173,13 +189,17 @@ static void WriteFromDouble(Vector &vec, idx_t offset, double value, const Logic
 		break;
 	case LogicalTypeId::HUGEINT: {
 		hugeint_t result;
-		Hugeint::TryConvert(value, result);
+		if (!Hugeint::TryConvert(value, result)) {
+			throw InvalidInputException("lttb: double value out of HUGEINT range on write-back: %f", value);
+		}
 		FlatVector::GetData<hugeint_t>(vec)[offset] = result;
 		break;
 	}
 	case LogicalTypeId::UHUGEINT: {
 		uhugeint_t result;
-		Uhugeint::TryConvert(value, result);
+		if (!Uhugeint::TryConvert(value, result)) {
+			throw InvalidInputException("lttb: double value out of UHUGEINT range on write-back: %f", value);
+		}
 		FlatVector::GetData<uhugeint_t>(vec)[offset] = result;
 		break;
 	}
@@ -205,24 +225,31 @@ static void WriteFromDouble(Vector &vec, idx_t offset, double value, const Logic
 		break;
 	case LogicalTypeId::DECIMAL: {
 		const auto scale = DecimalType::GetScale(type);
-		double multiplier = 1.0;
-		for (uint8_t i = 0; i < scale; i++) {
-			multiplier *= 10.0;
-		}
+		const auto multiplier = POW10[scale];
 		const auto scaled = std::llround(value * multiplier);
+		// Clamp guards against implementation-defined narrowing from int64_t to
+		// the physical int type when ULP round-trip jitter pushes a boundary
+		// DECIMAL value out of range. LTTB only selects existing input values,
+		// so the clamp never alters a legitimately-selected point.
 		switch (type.InternalType()) {
 		case PhysicalType::INT16:
-			FlatVector::GetData<int16_t>(vec)[offset] = static_cast<int16_t>(scaled);
+			FlatVector::GetData<int16_t>(vec)[offset] = static_cast<int16_t>(
+			    MaxValue<int64_t>(MinValue<int64_t>(scaled, std::numeric_limits<int16_t>::max()),
+			                      std::numeric_limits<int16_t>::min()));
 			break;
 		case PhysicalType::INT32:
-			FlatVector::GetData<int32_t>(vec)[offset] = static_cast<int32_t>(scaled);
+			FlatVector::GetData<int32_t>(vec)[offset] = static_cast<int32_t>(
+			    MaxValue<int64_t>(MinValue<int64_t>(scaled, std::numeric_limits<int32_t>::max()),
+			                      std::numeric_limits<int32_t>::min()));
 			break;
 		case PhysicalType::INT64:
-			FlatVector::GetData<int64_t>(vec)[offset] = static_cast<int64_t>(scaled);
+			FlatVector::GetData<int64_t>(vec)[offset] = scaled;
 			break;
 		default: {
 			hugeint_t result;
-			Hugeint::TryConvert(value * multiplier, result);
+			if (!Hugeint::TryConvert(value * multiplier, result)) {
+				throw InvalidInputException("lttb: DECIMAL value out of range on write-back: %f", value);
+			}
 			FlatVector::GetData<hugeint_t>(vec)[offset] = result;
 			break;
 		}
