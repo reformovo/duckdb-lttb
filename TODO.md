@@ -190,17 +190,18 @@ operate on doubles internally; type conversion happens at I/O boundaries.
   - **Status**: implemented; speculative for typical batch workloads —
     benchmark post-hoc to confirm value.
 
-- [ ] Implement `bucket_stats` aggregate function (new, from @oracle review)
+- [x] Implement `bucket_stats` aggregate function (new, from @oracle review)
   - **Use case**: AI agents need distribution analysis (min/max/mean/std per
     bucket), not just visual curve shape. Standard LTTB preserves shape but
     discards distribution information. Bucket statistics are more valuable for
     LLM reasoning about data patterns.
-  - **Proposed API**:
+  - **Implemented API**:
     `bucket_stats(x, y, num_buckets) → STRUCT(bucket_start, bucket_end, count, min, max, mean, std, first, last)[]`
-  - **Implementation**: Low complexity. No sorting or triangle computation
-    needed — just linear scan + per-bucket statistical aggregation. Can reuse
-    `LTTBState` (point accumulation), with a different Finalize that computes
-    bucket statistics instead of LTTB selection.
+  - **Implementation**: Reuses LTTBState (point accumulation) with new
+    BucketStatsUpdate and BucketStatsFinalize. Equal-count-by-index bucketing
+    (same formula as LTTB). Stats over y only; x provides bucket range
+    boundaries. Population std (divide by N). min/max/first/last preserve
+    y_type; mean/std are DOUBLE. No sort or triangle computation — linear scan.
   - **PulseOn mapping**: Exposed as `get_metric_digest(algorithm='bucket_stats')`
     in `AgentToolInterface`. Agents can first use `bucket_stats` to understand
     distribution, then `lttb` to see curve shape.
