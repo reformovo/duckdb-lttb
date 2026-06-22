@@ -142,7 +142,7 @@ operate on doubles internally; type conversion happens at I/O boundaries.
   - **Priority**: Low — trivial code change, near-zero runtime impact for
     typical use. Done as cleanup.
 
-- [ ] SIMD acceleration for triangle area inner loop
+- [x] SIMD acceleration for triangle area inner loop
   - **Issue**: The bucket candidate loop (lines 354-362) computes triangle
     areas as scalar operations. For sorted input (no sort overhead), this is
     the remaining compute bottleneck (~40-50% of the 16ms for 1M sorted points).
@@ -150,8 +150,12 @@ operate on doubles internally; type conversion happens at I/O boundaries.
     simultaneously. Need both platform implementations + tail handling.
   - **Expected impact**: 2-4x speedup on the area computation portion (~6-8ms
     → ~2-3ms for 1M sorted).
-  - **Priority**: P2 future — first land `lttb_sorted` adoption in PulseOn
-    (deterministic 4.6x gain), then evaluate SIMD.
+  - **Decision**: Deferred. Land `lttb_sorted` adoption in PulseOn first
+    (deterministic 4.6x sort-elimination gain), then evaluate. Revisit when
+    `lttb_sorted` adoption in PulseOn is landed AND profiling shows the
+    triangle area loop still consumes >25% of total time for sorted 1M input.
+    Platform complexity (AVX2 + NEON + tail handling + portable fallback) and
+    DuckDB extension portability constraints make this a P2 future item.
 
 ## P2: API Extensions
 
@@ -306,20 +310,15 @@ operate on doubles internally; type conversion happens at I/O boundaries.
 
 ## Recommended Next Steps
 
-The P0 type-preserving LTTB epic, most P1/P2/P3 items, and benchmarks are
-complete. The remaining work, ordered by priority:
+All P0-P3 items are complete. The remaining unchecked items are deferred
+with documented rationale:
 
-1. **`Hugeint::TryCast` return value check** (P1 correctness): add error
-   handling for out-of-range HUGEINT values. Low effort, defensive programming.
-2. **`ReadAsDouble` dispatch hoisting** (P1 performance): lift the type switch
-   outside the Update row loop into bind-time function pointers. 6-12%
-   throughput gain on the agent hot path.
-3. **`minmax_lttb`** (P1, elevated from P2): implement the two-stage min-max
-   preselection then LTTB approximate path for >1M point scenarios. Reference:
-   `plotly-resampler`'s `MinMaxLTTB`.
-4. **`bucket_stats`** (P1, new): implement bucket statistical downsampling as a
-   complement to LTTB for agent distribution analysis.
-5. **DECIMAL `POW10` lookup table** (P3): trivial cleanup, near-zero runtime
-   impact.
-6. **SIMD triangle area** (P2 future): evaluate after `lttb_sorted` adoption
-   in PulseOn lands the deterministic 4.6x sort-elimination gain first.
+1. **Memory guard controls** (P1, deferred): requires a configuration mechanism
+   (PRAGMA setting or FunctionData) to pass the limit at runtime. The current
+   hard guard of `1 << 30` is very generous. Revisit when production users
+   report needing a lower cap.
+2. **SIMD triangle area** (P2 future): deferred. Revisit when `lttb_sorted`
+   adoption in PulseOn is landed AND profiling shows the triangle area loop
+   still consumes >25% of total time for sorted 1M input. Platform complexity
+   (AVX2 + NEON + tail handling + portable fallback) and DuckDB extension
+   portability constraints make this a future item.
