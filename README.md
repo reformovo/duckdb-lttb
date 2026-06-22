@@ -7,6 +7,8 @@ lttb(x, y, n)
 largestTriangleThreeBuckets(x, y, n)
 lttb_sorted(x, y, n)
 lttb_indices(x, y, n)
+minmax_lttb(x, y, n, minmax_ratio)
+bucket_stats(x, y, num_buckets)
 ```
 
 The behavior is modeled after ClickHouse `largestTriangleThreeBuckets` / `lttb`. See `docs/reference/clickhouse-lttb.md` for the archived reference behavior and test sources.
@@ -19,12 +21,35 @@ The behavior is modeled after ClickHouse `largestTriangleThreeBuckets` / `lttb`.
 | `largestTriangleThreeBuckets(x, y, n)` | Alias for `lttb`. |
 | `lttb_sorted(x, y, n)` | Same as `lttb` but skips the sort. Caller must guarantee input is already ordered by `x`. |
 | `lttb_indices(x, y, n)` | Same selection as `lttb` but returns `BIGINT[]` of selected sorted-position indices instead of points. |
+| `minmax_lttb(x, y, n, minmax_ratio)` | Two-stage MinMax preselection + LTTB. `minmax_ratio` defaults to 4 (NULL). Reduces the LTTB triangle loop to ~`n * minmax_ratio` candidates. Approximate, not exact LTTB. |
+| `bucket_stats(x, y, num_buckets)` | Per-bucket statistical downsampling. Returns `STRUCT(bucket_start, bucket_end, count, min, max, mean, std, first, last)[]` with y-only stats and x range boundaries. |
 
 ### Supported Input Types
 
 Both `x` and `y` accept: `DOUBLE`, `FLOAT`, `TINYINT`, `SMALLINT`, `INTEGER`, `BIGINT`, `HUGEINT`, `UTINYINT`, `USMALLINT`, `UINTEGER`, `UBIGINT`, `UHUGEINT`, `DATE`, `TIMESTAMP`, `TIMESTAMP_TZ`, `TIMESTAMP_S`, `TIMESTAMP_MS`, `TIMESTAMP_NS`, `DECIMAL`.
 
 The output preserves both `x` and `y` types: `STRUCT(x typed, y typed)[]`, matching ClickHouse `Array(Tuple(...))` semantics.
+
+### minmax_lttb
+
+`minmax_lttb(x, y, n, minmax_ratio)` implements the `plotly-resampler` `MinMaxLTTB` algorithm: Stage 1 divides interior points into `n * minmax_ratio / 2` equi-width x-range bins, keeping `argmin(y)` and `argmax(y)` per bin (first/last points always preserved). Stage 2 runs LTTB over the reduced candidate set.
+
+- `minmax_ratio` defaults to 4 (pass `NULL` for the default). `minmax_ratio <= 1` is rejected.
+- When `n / minmax_ratio <= n_out`, degenerates to standard LTTB (no preselect).
+- Both `n` and `minmax_ratio` must be constant within each aggregate group.
+- **Note**: In DuckDB's aggregate model, all points are accumulated in Update (O(n) memory) — there is no memory win vs standard LTTB. The win is compute: the LTTB triangle loop runs on ~`n * minmax_ratio` candidates instead of `n` points.
+- Output preserves input types, matching `lttb`/`lttb_sorted`.
+
+### bucket_stats
+
+`bucket_stats(x, y, num_buckets)` returns per-bucket statistical summaries for distribution analysis. Useful for AI agents that need to understand data patterns, not just visual curve shape.
+
+Output: `STRUCT(bucket_start, bucket_end, count, min, max, mean, std, first, last)[]`
+
+- Stats are over `y` only; `x` provides bucket range boundaries (`bucket_start`, `bucket_end`).
+- Equal-count-by-index bucketing (same formula as LTTB). First and last points are singletons.
+- Population std (divide by N, not N-1).
+- `min`/`max`/`first`/`last` preserve `y` type; `mean`/`std` are `DOUBLE`.
 
 ### ClickHouse Syntax Difference
 
