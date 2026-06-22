@@ -1,16 +1,23 @@
 #!/usr/bin/env bash
-# Three-way benchmark: DuckDB lttb vs ClickHouse vs Python lttb.
+# Benchmark for the DuckDB lttb extension.
 #
-# All three process the same synthetic sine-wave datasets. Timing method:
+# Part A (sections 1-4): Three-way comparison DuckDB vs ClickHouse vs Python lttb.
+#   Requires: ClickHouse container running, Python duckdb+lttb+numpy installed.
+#
+# Part B (sections 5-10): DuckDB-internal function-level benchmark.
+#   Tests all registered functions (lttb, lttb_sorted, lttb_indices,
+#   minmax_lttb, bucket_stats). Only requires DuckDB + the extension.
+#
+# If the ClickHouse container is not running, Part A is skipped and only
+# Part B runs.
+#
+# Timing method:
 #   - DuckDB:   CLI .timer (includes subprocess startup)
 #   - ClickHouse: clickhouse-client --time (server-side, excludes connection)
 #   - Python:   Python time.perf_counter (in-process, excludes DuckDB fetch)
 #
-# For the fairest comparison, we also report DuckDB's query-only time by
-# running setup + query in a single session and measuring only the query.
-#
 # Usage:
-#   ./scripts/benchmark_three_way.sh \
+#   ./scripts/benchmark.sh \
 #     [--duckdb ./build/release/duckdb] \
 #     [--extension ./build/release/extension/lttb/lttb.duckdb_extension] \
 #     [--container swanlab-clickhouse]
@@ -32,9 +39,14 @@ done
 
 if [ ! -x "$DUCKDB" ]; then echo "Error: duckdb not found at $DUCKDB" >&2; exit 1; fi
 if [ ! -f "$EXTENSION" ]; then echo "Error: extension not found at $EXTENSION" >&2; exit 1; fi
-if ! container list 2>/dev/null | grep -q "$CONTAINER"; then echo "Error: container '$CONTAINER' not running" >&2; exit 1; fi
 
-CH_VERSION=$(container exec "$CONTAINER" clickhouse-client -q "SELECT version()" 2>/dev/null)
+# ClickHouse is optional — Part A is skipped if the container is not running.
+HAS_CLICKHOUSE=false
+if container list 2>/dev/null | grep -q "$CONTAINER"; then
+    HAS_CLICKHOUSE=true
+    CH_VERSION=$(container exec "$CONTAINER" clickhouse-client -q "SELECT version()" 2>/dev/null)
+fi
+
 LOAD="LOAD '$EXTENSION';"
 
 # --- Timing helpers ---
@@ -90,17 +102,27 @@ con.close()
 # --- Output ---
 
 echo "================================================================================"
-echo "Three-Way Benchmark: DuckDB lttb vs ClickHouse vs Python lttb"
+echo "Benchmark: DuckDB lttb extension"
 echo "================================================================================"
-echo "DuckDB:     $DUCKDB (extension: $EXTENSION)"
-echo "ClickHouse: $CONTAINER (v$CH_VERSION)"
-echo "Python:     lttb 0.3.2 + duckdb 1.4.5 + numpy 1.26.4"
-echo "Date:       $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-echo "Method:     best of 5 runs"
-echo "Notes:      DuckDB timing includes CLI subprocess startup."
-echo "            ClickHouse timing is server-side (--time, excludes connection)."
-echo "            Python timing is in-process (perf_counter, includes fetch+downsample)."
+echo "DuckDB:    $DUCKDB (extension: $EXTENSION)"
+if $HAS_CLICKHOUSE; then
+    echo "ClickHouse: $CONTAINER (v$CH_VERSION)"
+else
+    echo "ClickHouse: not running (Part A skipped)"
+fi
+echo "Python:    lttb 0.3.2 + duckdb 1.4.5 + numpy 1.26.4"
+echo "Date:      $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+echo "Method:    best of 5 runs"
+echo "Notes:     DuckDB timing includes CLI subprocess startup."
+echo "           ClickHouse timing is server-side (--time, excludes connection)."
+echo "           Python timing is in-process (perf_counter, includes fetch+downsample)."
 echo ""
+
+# ============================================================================
+# Part A: Three-way comparison (DuckDB vs ClickHouse vs Python)
+# ============================================================================
+
+if $HAS_CLICKHOUSE; then
 
 # --- Section 1: Sorted DOUBLE input ---
 echo "=== Section 1: Sorted DOUBLE input ==="
@@ -222,6 +244,165 @@ for SIZE in 100000 1000000; do
 
     printf "%-18s %6s %12s %12s\n" "$LABEL" "$N" "$DDB" "$CH"
 done
+
+echo ""
+
+fi  # end Part A (HAS_CLICKHOUSE)
+
+# ============================================================================
+# Part B: DuckDB-internal function-level benchmark
+# ============================================================================
+
+# --- Section 5: All functions on sorted 1M input, n=1000 ---
+echo "=== Section 5: All functions on sorted 1M input (n=1000) ==="
+echo ""
+printf "%-18s %12s\n" "Function" "Time(ms)"
+printf "%-18s %12s\n" ".................." "............"
+echo "--------------------------------------------------"
+
+SETUP_SORTED="$LOAD CREATE TABLE b AS SELECT i::DOUBLE AS x, sin(i/1000000.0)::DOUBLE AS y FROM range(1000000) AS t(i);"
+
+for FUNC in lttb lttb_sorted lttb_indices; do
+    QUERY="$LOAD SELECT count(*) FROM (SELECT unnest(${FUNC}(x, y, 1000)) FROM b);"
+    T=$(bench_duckdb "$SETUP_SORTED" "$QUERY")
+    printf "%-18s %12s\n" "$FUNC" "$T"
+done
+
+QUERY="$LOAD SELECT count(*) FROM (SELECT unnest(minmax_lttb(x, y, 1000, 4)) FROM b);"
+T=$(bench_duckdb "$SETUP_SORTED" "$QUERY")
+printf "%-18s %12s\n" "minmax_lttb(r=4)" "$T"
+
+QUERY="$LOAD SELECT count(*) FROM (SELECT unnest(minmax_lttb(x, y, 1000, 8)) FROM b);"
+T=$(bench_duckdb "$SETUP_SORTED" "$QUERY")
+printf "%-18s %12s\n" "minmax_lttb(r=8)" "$T"
+
+QUERY="$LOAD SELECT count(*) FROM (SELECT unnest(bucket_stats(x, y, 1000)) FROM b);"
+T=$(bench_duckdb "$SETUP_SORTED" "$QUERY")
+printf "%-18s %12s\n" "bucket_stats" "$T"
+
+echo ""
+
+# --- Section 6: lttb vs lttb_sorted (sort cost) at multiple scales ---
+echo "=== Section 6: lttb vs lttb_sorted (sort cost) ==="
+echo ""
+printf "%-18s %6s %12s %12s %12s\n" "Dataset" "n_out" "lttb(ms)" "sorted(ms)" "Sort cost"
+printf "%-18s %6s %12s %12s %12s\n" "................" "......" "............" "............" "............"
+echo "------------------------------------------------------------------------"
+
+for SIZE in 10000 100000 1000000; do
+    N=1000
+    LABEL="$((SIZE / 1000))K"
+
+    SETUP="$LOAD CREATE TABLE b AS SELECT i::DOUBLE AS x, sin(i/${SIZE}.0)::DOUBLE AS y FROM range(${SIZE}) AS t(i);"
+    Q_LTTB="$LOAD SELECT count(*) FROM (SELECT unnest(lttb(x, y, ${N})) FROM b);"
+    Q_SORTED="$LOAD SELECT count(*) FROM (SELECT unnest(lttb_sorted(x, y, ${N})) FROM b);"
+
+    T_LTTB=$(bench_duckdb "$SETUP" "$Q_LTTB")
+    T_SORTED=$(bench_duckdb "$SETUP" "$Q_SORTED")
+    SORT_COST=$(echo "$T_LTTB - $T_SORTED" | bc -l | awk '{printf "%.1f", $1}')
+
+    printf "%-18s %6s %12s %12s %12s\n" "$LABEL" "$N" "$T_LTTB" "$T_SORTED" "$SORT_COST"
+done
+
+echo ""
+
+# --- Section 7: lttb vs minmax_lttb (preselect compute win) ---
+echo "=== Section 7: lttb vs minmax_lttb (preselect compute win) ==="
+echo ""
+printf "%-18s %6s %12s %12s %12s\n" "Dataset" "n_out" "lttb(ms)" "minmax(ms)" "Speedup"
+printf "%-18s %6s %12s %12s %12s\n" "................" "......" "............" "............" "............"
+echo "------------------------------------------------------------------------"
+
+for SIZE in 100000 1000000; do
+    for N in 100 1000; do
+        LABEL="$((SIZE / 1000))K"
+
+        SETUP="$LOAD CREATE TABLE b AS SELECT i::DOUBLE AS x, sin(i/${SIZE}.0)::DOUBLE AS y FROM range(${SIZE}) AS t(i);"
+        Q_LTTB="$LOAD SELECT count(*) FROM (SELECT unnest(lttb(x, y, ${N})) FROM b);"
+        Q_MINMAX="$LOAD SELECT count(*) FROM (SELECT unnest(minmax_lttb(x, y, ${N}, 4)) FROM b);"
+
+        T_LTTB=$(bench_duckdb "$SETUP" "$Q_LTTB")
+        T_MINMAX=$(bench_duckdb "$SETUP" "$Q_MINMAX")
+
+        if (( $(echo "$T_MINMAX > 0" | bc -l) )); then
+            SPEEDUP=$(echo "scale=2; $T_LTTB / $T_MINMAX" | bc -l)
+        else
+            SPEEDUP="N/A"
+        fi
+
+        printf "%-18s %6s %12s %12s %12sx\n" "$LABEL" "$N" "$T_LTTB" "$T_MINMAX" "$SPEEDUP"
+    done
+done
+
+echo ""
+
+# --- Section 8: bucket_stats at multiple scales ---
+echo "=== Section 8: bucket_stats performance ==="
+echo ""
+printf "%-18s %6s %12s\n" "Dataset" "buckets" "Time(ms)"
+printf "%-18s %6s %12s\n" "................" "......" "............"
+echo "--------------------------------------------------"
+
+for SIZE in 10000 100000 1000000; do
+    for N in 100 1000; do
+        LABEL="$((SIZE / 1000))K"
+
+        SETUP="$LOAD CREATE TABLE b AS SELECT i::DOUBLE AS x, sin(i/${SIZE}.0)::DOUBLE AS y FROM range(${SIZE}) AS t(i);"
+        QUERY="$LOAD SELECT count(*) FROM (SELECT unnest(bucket_stats(x, y, ${N})) FROM b);"
+
+        T=$(bench_duckdb "$SETUP" "$QUERY")
+        printf "%-18s %6s %12s\n" "$LABEL" "$N" "$T"
+    done
+done
+
+echo ""
+
+# --- Section 9: Shuffled input (lttb sort cost) ---
+echo "=== Section 9: Shuffled input (sort cost) ==="
+echo ""
+printf "%-18s %6s %12s %12s\n" "Dataset" "n_out" "lttb(ms)" "sorted(ms)*"
+printf "%-18s %6s %12s %12s\n" "................" "......" "............" "............"
+echo "----------------------------------------------------------------"
+echo "(* lttb_sorted on shuffled input gives WRONG results but shows sort-eliminated time)"
+
+for SIZE in 100000 1000000; do
+    N=1000
+    LABEL="$((SIZE / 1000))K shuf"
+
+    SETUP="$LOAD CREATE TABLE b AS SELECT x, y FROM (SELECT i::DOUBLE AS x, sin(i/${SIZE}.0)::DOUBLE AS y FROM range(${SIZE}) AS t(i)) ORDER BY random();"
+    Q_LTTB="$LOAD SELECT count(*) FROM (SELECT unnest(lttb(x, y, ${N})) FROM b);"
+    Q_SORTED="$LOAD SELECT count(*) FROM (SELECT unnest(lttb_sorted(x, y, ${N})) FROM b);"
+
+    T_LTTB=$(bench_duckdb "$SETUP" "$Q_LTTB")
+    T_SORTED=$(bench_duckdb "$SETUP" "$Q_SORTED")
+
+    printf "%-18s %6s %12s %12s\n" "$LABEL" "$N" "$T_LTTB" "$T_SORTED"
+done
+
+echo ""
+
+# --- Section 10: Multi-group all functions ---
+echo "=== Section 10: Multi-group (100 groups, 1M total) ==="
+echo ""
+printf "%-18s %12s\n" "Function" "Time(ms)"
+printf "%-18s %12s\n" ".................." "............"
+echo "--------------------------------------------------"
+
+SETUP_GROUP="$LOAD CREATE TABLE b AS SELECT (i % 100)::INTEGER AS g, (i / 100)::DOUBLE AS x, sin(i/1000000.0)::DOUBLE AS y FROM range(1000000) AS t(i);"
+
+for FUNC in lttb lttb_sorted lttb_indices; do
+    QUERY="$LOAD SELECT count(*) FROM (SELECT unnest(${FUNC}(x, y, 100)) FROM b GROUP BY g);"
+    T=$(bench_duckdb "$SETUP_GROUP" "$QUERY")
+    printf "%-18s %12s\n" "$FUNC" "$T"
+done
+
+QUERY="$LOAD SELECT count(*) FROM (SELECT unnest(minmax_lttb(x, y, 100, 4)) FROM b GROUP BY g);"
+T=$(bench_duckdb "$SETUP_GROUP" "$QUERY")
+printf "%-18s %12s\n" "minmax_lttb(r=4)" "$T"
+
+QUERY="$LOAD SELECT count(*) FROM (SELECT unnest(bucket_stats(x, y, 100)) FROM b GROUP BY g);"
+T=$(bench_duckdb "$SETUP_GROUP" "$QUERY")
+printf "%-18s %12s\n" "bucket_stats" "$T"
 
 echo ""
 echo "================================================================================"

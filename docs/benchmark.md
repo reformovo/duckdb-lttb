@@ -157,7 +157,7 @@
 
 ## 7. 函数级性能对比（DuckDB 内部）
 
-对 DuckDB lttb 扩展的所有注册函数在相同数据集上进行性能对比，测试环境同上。
+对 DuckDB lttb 扩展的所有注册函数在相同数据集上进行性能对比，测试环境同上。这部分由 `scripts/benchmark.sh` 的 Part B（Section 5-10）生成，只需 DuckDB + 扩展，不需要 ClickHouse 或 Python。
 
 ### 7.1 全函数对比（1M 已排序输入，n=1000）
 
@@ -166,9 +166,9 @@
 | `lttb` | 15.0 | 排序 + LTTB 采样 |
 | `lttb_sorted` | 9.0 | 跳过排序，直接 LTTB 采样 |
 | `lttb_indices` | 15.0 | 排序 + LTTB，输出索引 |
-| `minmax_lttb(r=4)` | 15.0 | MinMax 预选 + LTTB |
+| `minmax_lttb(r=4)` | 14.0 | MinMax 预选 + LTTB |
 | `minmax_lttb(r=8)` | 15.0 | MinMax 预选（更大候选集）+ LTTB |
-| `bucket_stats` | 15.0 | 等计数分桶 + 统计聚合 |
+| `bucket_stats` | 14.0 | 等计数分桶 + 统计聚合 |
 
 ### 分析
 

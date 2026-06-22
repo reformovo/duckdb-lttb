@@ -522,7 +522,7 @@ duckdb-lttb/
 │   ├── UPDATING.md                # DuckDB 版本升级指南
 │   └── architecture.md            # 本文档
 ├── scripts/
-│   └── benchmark.sh               # 三方性能对比脚本（DuckDB/ClickHouse/Python）
+│   └── benchmark.sh               # 性能基准测试（三方对比 + 函数级对比）
 ├── CMakeLists.txt                 # 构建配置
 ├── extension_config.cmake         # 扩展配置
 ├── Makefile                       # 构建入口
