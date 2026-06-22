@@ -168,7 +168,7 @@ operate on doubles internally; type conversion happens at I/O boundaries.
     sorted-position indices. Useful for frontends that want to know which
     points were selected without reconstructing the full point values.
 
-- [ ] Implement `minmax_lttb` approximate path (elevated to P1)
+- [x] Implement `minmax_lttb` approximate path (elevated to P1)
   - **Reference**: `plotly-resampler` `MinMaxLTTB` — min-max preselection then
     LTTB, recommended for >1M samples in interactive visualization.
   - **Why elevated**: PulseOn's auto-research workflow may encounter long
@@ -176,16 +176,19 @@ operate on doubles internally; type conversion happens at I/O boundaries.
     (16MB per 1M points per group). MinMaxLTTB reduces memory to O(buckets × 4)
     by pre-selecting first/last/min/max per coarse bucket, then running LTTB
     over the reduced candidate set.
-  - **Proposed API**: `minmax_lttb(x, y, n, coarse_buckets)`
-    - `coarse_buckets = 0`: degenerates to standard LTTB
-    - `coarse_buckets >= n`: same as standard LTTB
-    - Recommended: `coarse_buckets = n * 4` (plotly-resampler default)
-  - **Implementation**: New aggregate state `MinMaxLTTBState` storing per-coarse-
-    bucket min/max instead of all points. Or reuse `LTTBState` with a two-stage
-    Finalize (MinMax preselect → LTTB). Need to handle odd-count buckets where
-    min/max may be the same point.
+  - **Implemented API**: `minmax_lttb(x, y, n, minmax_ratio)`
+    - `minmax_ratio = NULL`: default 4 (matches plotly-resampler)
+    - `minmax_ratio <= 1`: error
+    - `n / minmax_ratio <= n`: degenerates to standard LTTB
+  - **Implementation**: Two-stage Finalize reusing LTTBState (accumulate all
+    points in Update, MinMax preselect in Finalize → LTTB on candidates).
+    NOTE: NO memory win in DuckDB's aggregate model (O(n) accumulation); the
+    win is compute (LTTB triangle loop on ~n*ratio candidates instead of n).
+    Equi-width x-range bins; per bin keep argmin(y)/argmax(y); first/last
+    always preserved.
   - **Document**: This is approximate, not exact LTTB.
-  - **Status**: design only — not yet implemented.
+  - **Status**: implemented; speculative for typical batch workloads —
+    benchmark post-hoc to confirm value.
 
 - [ ] Implement `bucket_stats` aggregate function (new, from @oracle review)
   - **Use case**: AI agents need distribution analysis (min/max/mean/std per
