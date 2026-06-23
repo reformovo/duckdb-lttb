@@ -195,6 +195,46 @@ operate on doubles internally; type conversion happens at I/O boundaries.
   - **Status**: implemented; speculative for typical batch workloads —
     benchmark post-hoc to confirm value.
 
+### MinMaxLTTB follow-up optimization candidates
+
+- [ ] Add `minmax_lttb_sorted(x, y, n, minmax_ratio)` fast path
+  - Current `minmax_lttb` always sorts before MinMax preselection. PulseOn's
+    `metric_points` path is naturally ordered by `step`, so a sorted-input
+    variant can skip `stable_sort` just like `lttb_sorted`.
+  - Expected value: deterministic sort-elimination win for the only realistic
+    PulseOn use case. This should be attempted before lower-level SIMD work.
+
+- [ ] SIMD/vectorize MinMax preselection (`argminmax` parity with tsdownsample)
+  - Benchmarks show `tsdownsample` MinMaxLTTB is 1.4-2.0x faster than LTTB when
+    `size / n_out` is large, while this C++ implementation is ~1.0x. The likely
+    gap is `tsdownsample`'s SIMD-optimized `argminmax` preselection.
+  - Implement AVX2 (x86) / NEON (ARM) / scalar fallback for per-bin `argmin(y)`
+    and `argmax(y)`, preserving original sorted indices and tail handling.
+  - Acceptance gate: demonstrate a stable >1.25x speedup over `lttb_sorted` or
+    `lttb` for 1M→100/1000 and 5M→100/1000 scenarios before recommending it.
+
+- [ ] Evaluate candidate-set materialization/cache API
+  - Current `minmax_lttb` candidate vectors are temporary inside Finalize and are
+    discarded after each query. Therefore it cannot support "preselect once,
+    resample many times" interactive workflows.
+  - Explore an explicit API such as `minmax_candidates(x, y, n, ratio)` or
+    `minmax_lttb_indices(...)` that returns/persists candidate points or sorted
+    indices. Consumers could materialize the candidate set into a temporary table
+    and run exact `lttb`/`lttb_sorted` repeatedly for different `n_out` values.
+  - Only pursue if PulseOn or UI workloads actually need repeated downsampling
+    over the same visible range.
+
+- [ ] Revisit true low-memory MinMax state design
+  - The current implementation still accumulates all points in `LTTBState`, so
+    memory is O(n), not O(n_out × ratio). True streaming MinMax with equi-width
+    x-range bins needs `x_min`/`x_max` known before Update, which a normal DuckDB
+    aggregate does not provide.
+  - Possible designs: require explicit `x_min`/`x_max` parameters, use a two-pass
+    table function, or accept an equal-count-by-index approximation that differs
+    from `tsdownsample`'s x-range bins.
+  - Defer until memory pressure is observed; `lttb_sorted` is currently the
+    better PulseOn default.
+
 - [x] Implement `bucket_stats` aggregate function (new, from @oracle review)
   - **Use case**: AI agents need distribution analysis (min/max/mean/std per
     bucket), not just visual curve shape. Standard LTTB preserves shape but
@@ -311,14 +351,25 @@ operate on doubles internally; type conversion happens at I/O boundaries.
 
 ## Recommended Next Steps
 
-All P0-P3 items are complete. The remaining unchecked items are deferred
-with documented rationale:
+Most P0-P3 items are complete. The remaining unchecked items are optimization
+follow-ups or deferred controls:
 
-1. **Memory guard controls** (P1, deferred): requires a configuration mechanism
+1. **`minmax_lttb_sorted`** (P1/P2): add a sorted-input fast path before any
+   lower-level MinMaxLTTB work. This is the most likely practical improvement
+   for PulseOn because `metric_points` is ordered by `step`.
+2. **SIMD/vectorized MinMax preselection** (P2): close the gap with
+   `tsdownsample` only if benchmarks show >1.25x speedup on large-input/small-
+   `n_out` scenarios.
+3. **Candidate-set materialization/cache API** (P2 design): only pursue if UI or
+   PulseOn workflows need repeated downsampling over the same visible range.
+4. **True low-memory MinMax state** (P2/R&D): requires explicit x bounds, a
+   two-pass/table-function design, or an equal-count approximation; defer until
+   memory pressure is observed.
+5. **Memory guard controls** (P1, deferred): requires a configuration mechanism
    (PRAGMA setting or FunctionData) to pass the limit at runtime. The current
    hard guard of `1 << 30` is very generous. Revisit when production users
    report needing a lower cap.
-2. **SIMD triangle area** (P2 future): deferred. Revisit when `lttb_sorted`
+6. **SIMD triangle area** (P2 future): deferred. Revisit when `lttb_sorted`
    adoption in PulseOn is landed AND profiling shows the triangle area loop
    still consumes >25% of total time for sorted 1M input. Platform complexity
    (AVX2 + NEON + tail handling + portable fallback) and DuckDB extension
