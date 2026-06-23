@@ -288,7 +288,7 @@ operate on doubles internally; type conversion happens at I/O boundaries.
 
 ### Code review follow-ups (2026-06-23, bin-first MinMaxLTTB)
 
-- [ ] Fix 2-point equal-y bin dropping a candidate (regression)
+- [x] Fix 2-point equal-y bin dropping a candidate (regression)
   - **Issue**: In `MinMaxLTTBFinalize`, the `bin.count <= 2` branch keeps
     `min_point` and only pushes `max_point` when `bin.max_idx != bin.min_idx`.
     Min/max tracking uses strict `<`/`>`, so a 2-point bin with equal y leaves

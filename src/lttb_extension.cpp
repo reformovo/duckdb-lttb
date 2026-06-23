@@ -896,6 +896,14 @@ static void MinMaxLTTBFinalize(Vector &state_vector, AggregateInputData &input_d
 				// x-range bins, keeping argmin(y)/argmax(y) per bin.
 				const auto n_minmax_buckets = (n_out * static_cast<uint64_t>(minmax_ratio)) / 2;
 				struct PerBin {
+					// First two points seen, kept verbatim so count<=2 bins retain
+					// both points even when y is constant (argmin/argmax tracking
+					// collapses equal-y points to a single index).
+					LTTBPoint first_point;
+					LTTBPoint second_point;
+					idx_t first_idx;
+					idx_t second_idx;
+					// argmin(y) / argmax(y) over the bin, used when count > 2.
 					LTTBPoint min_point;
 					LTTBPoint max_point;
 					idx_t min_idx;
@@ -921,25 +929,31 @@ static void MinMaxLTTBFinalize(Vector &state_vector, AggregateInputData &input_d
 							bin_idx = n_minmax_buckets - 1;
 						}
 					}
-					auto &bin = bins[bin_idx];
-					if (!bin.has_data) {
-						bin.min_point = points[i];
-						bin.max_point = points[i];
-						bin.min_idx = i;
-						bin.max_idx = i;
-						bin.count = 1;
-						bin.has_data = true;
-					} else {
-						bin.count++;
-						if (points[i].y < bin.min_point.y) {
-							bin.min_point = points[i];
-							bin.min_idx = i;
-						}
-						if (points[i].y > bin.max_point.y) {
-							bin.max_point = points[i];
-							bin.max_idx = i;
-						}
+auto &bin = bins[bin_idx];
+				if (!bin.has_data) {
+					bin.first_point = points[i];
+					bin.first_idx = i;
+					bin.min_point = points[i];
+					bin.max_point = points[i];
+					bin.min_idx = i;
+					bin.max_idx = i;
+					bin.count = 1;
+					bin.has_data = true;
+				} else {
+					bin.count++;
+					if (bin.count == 2) {
+						bin.second_point = points[i];
+						bin.second_idx = i;
 					}
+					if (points[i].y < bin.min_point.y) {
+						bin.min_point = points[i];
+						bin.min_idx = i;
+					}
+					if (points[i].y > bin.max_point.y) {
+						bin.max_point = points[i];
+						bin.max_idx = i;
+					}
+				}
 				}
 
 				// Step 3: candidate set = first + per-bin argmin/argmax + last.
@@ -951,12 +965,19 @@ static void MinMaxLTTBFinalize(Vector &state_vector, AggregateInputData &input_d
 					if (!bin.has_data) {
 						continue;
 					}
-					if (bin.count <= 2) {
-						candidates.push_back(bin.min_point);
-						if (bin.max_idx != bin.min_idx) {
-							candidates.push_back(bin.max_point);
-						}
+if (bin.count == 1) {
+					candidates.push_back(bin.first_point);
+				} else if (bin.count == 2) {
+					// Keep both points; argmin/argmax collapse equal-y pairs to one
+					// index, so the second point must come from explicit tracking.
+					if (bin.first_point.x <= bin.second_point.x) {
+						candidates.push_back(bin.first_point);
+						candidates.push_back(bin.second_point);
 					} else {
+						candidates.push_back(bin.second_point);
+						candidates.push_back(bin.first_point);
+					}
+				} else {
 						if (bin.min_point.x <= bin.max_point.x) {
 							candidates.push_back(bin.min_point);
 							candidates.push_back(bin.max_point);
