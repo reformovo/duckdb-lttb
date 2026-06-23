@@ -286,6 +286,52 @@ operate on doubles internally; type conversion happens at I/O boundaries.
     validates x/y against the supported type set and rejects unsupported types
     (e.g. VARCHAR) with a clear error message.
 
+### Code review follow-ups (2026-06-23, bin-first MinMaxLTTB)
+
+- [ ] Fix 2-point equal-y bin dropping a candidate (regression)
+  - **Issue**: In `MinMaxLTTBFinalize`, the `bin.count <= 2` branch keeps
+    `min_point` and only pushes `max_point` when `bin.max_idx != bin.min_idx`.
+    Min/max tracking uses strict `<`/`>`, so a 2-point bin with equal y leaves
+    `min_idx == max_idx` (both point at the first), the guard is false, and the
+    second point is silently dropped. The old `MinMaxPreselect` kept both points
+    unconditionally — this is a behavioral regression common for flat / integer
+    y segments.
+  - **Fix**: track the second point explicitly (or push both when count == 2).
+  - **Severity**: Medium (correctness regression on common input shapes).
+
+- [ ] Deduplicate all-equal-y bins (count > 2) producing duplicate candidates
+  - **Issue**: When every point in a bin shares the same y, `min_point` and
+    `max_point` both stay at the first point, so the `else` branch pushes the
+    same point twice. Pre-existing (old `MinMaxPreselect` had it too), not a
+    regression. Harmless to LTTB correctness (zero-area triangles) but wastes
+    candidate slots and can skew next-bucket averages slightly.
+  - **Fix**: push a single point when `min_idx == max_idx`.
+  - **Severity**: Low.
+
+- [ ] Extract `MinMaxLTTBBindFunctionImpl` to dedupe bind functions
+  - **Issue**: `MinMaxLTTBBindFunction` and `MinMaxLTTBSortedBindFunction` are
+    near-identical, differing only in the `sorted` flag and the function name in
+    the error message. The `lttb` family already factors this into
+    `LTTBBindFunctionImpl(context, function, arguments, sorted, indices)`.
+  - **Fix**: Add a `MinMaxLTTBBindFunctionImpl(..., sorted, func_name)` and have
+    both bind functions delegate.
+  - **Severity**: Style (DRY / keep variants in sync).
+
+- [ ] Normalize `Equals()` across `FunctionData` structs
+  - **Issue**: `LTTBFunctionData::Equals` checks all four read/write pointers;
+    `MinMaxLTTBFunctionData::Equals` checks only `sorted` + `minmax_ratio`;
+    `BucketStatsFunctionData::Equals` checks only `x_read`/`y_read`. The
+    pointers are determined by resolved types so equal names+args imply equal
+    pointers — not a bug, but the inconsistency is surprising.
+  - **Fix**: Either check all fields everywhere, or drop pointer checks
+    everywhere (relying on type identity). Pick one and apply uniformly.
+  - **Severity**: Style (consistency).
+
+- [ ] Add/refresh function doc comments (why, not how)
+  - Per the coding spec, public/static functions in `lttb_extension.cpp`
+    should carry a one-line intent comment where the purpose is not obvious
+    from the signature. Avoid restating what the code does.
+
 ## P3: Tests, Benchmarks, and Docs
 
 - [x] Add more SQLLogicTests
