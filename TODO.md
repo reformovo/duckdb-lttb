@@ -317,7 +317,7 @@ operate on doubles internally; type conversion happens at I/O boundaries.
     both bind functions delegate.
   - **Severity**: Style (DRY / keep variants in sync).
 
-- [ ] Normalize `Equals()` across `FunctionData` structs
+- [x] Normalize `Equals()` across `FunctionData` structs
   - **Issue**: `LTTBFunctionData::Equals` checks all four read/write pointers;
     `MinMaxLTTBFunctionData::Equals` checks only `sorted` + `minmax_ratio`;
     `BucketStatsFunctionData::Equals` checks only `x_read`/`y_read`. The

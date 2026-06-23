@@ -752,7 +752,11 @@ struct MinMaxLTTBFunctionData : public FunctionData {
 
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<MinMaxLTTBFunctionData>();
-		return sorted == other.sorted && minmax_ratio == other.minmax_ratio;
+		// Pointers are resolved from types at bind time, so equal names+args
+		// imply equal pointers — but compare them explicitly for traceability
+		// and to match LTTBFunctionData::Equals.
+		return sorted == other.sorted && minmax_ratio == other.minmax_ratio && x_read == other.x_read &&
+		       y_read == other.y_read && x_write == other.x_write && y_write == other.y_write;
 	}
 };
 
@@ -1101,7 +1105,8 @@ struct BucketStatsFunctionData : public FunctionData {
 
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<BucketStatsFunctionData>();
-		return x_read == other.x_read && y_read == other.y_read;
+		return x_read == other.x_read && y_read == other.y_read && x_write == other.x_write &&
+		       y_write == other.y_write;
 	}
 };
 
