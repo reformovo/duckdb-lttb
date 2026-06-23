@@ -299,7 +299,7 @@ operate on doubles internally; type conversion happens at I/O boundaries.
   - **Fix**: track the second point explicitly (or push both when count == 2).
   - **Severity**: Medium (correctness regression on common input shapes).
 
-- [ ] Deduplicate all-equal-y bins (count > 2) producing duplicate candidates
+- [x] Deduplicate all-equal-y bins (count > 2) producing duplicate candidates
   - **Issue**: When every point in a bin shares the same y, `min_point` and
     `max_point` both stay at the first point, so the `else` branch pushes the
     same point twice. Pre-existing (old `MinMaxPreselect` had it too), not a

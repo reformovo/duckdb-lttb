@@ -410,6 +410,14 @@ SELECT list_transform(minmax_lttb(x, y, 3, 4), lambda p: format('({}, {})', p.x:
 ----
 ['(1, 5)', '(2, 5)', '(10, 5)']
 
+# minmax_lttb bin-first with constant y and large bins (count > 2): argmin
+# and argmax collapse to the same point, so each bin contributes a single
+# candidate rather than a duplicate (regression guard for the dedupe fix).
+query I
+SELECT list_transform(minmax_lttb(x, y, 2, 2), lambda p: format('({}, {})', p.x::BIGINT, p.y::BIGINT)) FROM (SELECT i::DOUBLE AS x, 5.0::DOUBLE AS y FROM range(1, 11) AS t(i));
+----
+['(1, 5)', '(10, 5)']
+
 # minmax_lttb ratio <= 1 is rejected.
 statement error
 SELECT minmax_lttb(1.0, 1.0, 5, 1);

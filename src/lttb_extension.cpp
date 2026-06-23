@@ -977,16 +977,23 @@ if (bin.count == 1) {
 						candidates.push_back(bin.second_point);
 						candidates.push_back(bin.first_point);
 					}
-				} else {
-						if (bin.min_point.x <= bin.max_point.x) {
-							candidates.push_back(bin.min_point);
-							candidates.push_back(bin.max_point);
-						} else {
-							candidates.push_back(bin.max_point);
-							candidates.push_back(bin.min_point);
-						}
+} else {
+					// count > 2: keep argmin(y) and argmax(y). When every point in
+					// the bin shares the same y, min_idx == max_idx (both the first
+					// point), so push a single representative to avoid a duplicate
+					// candidate (harmless to LTTB but wastes a slot and skews the
+					// next-bucket average).
+					if (bin.min_idx == bin.max_idx) {
+						candidates.push_back(bin.min_point);
+					} else if (bin.min_point.x <= bin.max_point.x) {
+						candidates.push_back(bin.min_point);
+						candidates.push_back(bin.max_point);
+					} else {
+						candidates.push_back(bin.max_point);
+						candidates.push_back(bin.min_point);
 					}
 				}
+			}
 				// Guard against all-x-equal: first_idx == last_idx would duplicate
 				// the endpoint. Only push last when it is a distinct point.
 				if (last_idx != first_idx) {
