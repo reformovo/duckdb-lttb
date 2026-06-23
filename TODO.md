@@ -327,7 +327,7 @@ operate on doubles internally; type conversion happens at I/O boundaries.
     everywhere (relying on type identity). Pick one and apply uniformly.
   - **Severity**: Style (consistency).
 
-- [ ] Add/refresh function doc comments (why, not how)
+- [x] Add/refresh function doc comments (why, not how)
   - Per the coding spec, public/static functions in `lttb_extension.cpp`
     should carry a one-line intent comment where the purpose is not obvious
     from the signature. Avoid restating what the code does.

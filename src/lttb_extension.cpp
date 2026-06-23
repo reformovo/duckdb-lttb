@@ -302,6 +302,9 @@ static WriteFunc MakeWriter(const LogicalType &type) {
 	}
 }
 
+// Whitelist of x/y types the extension can read/write. Bind rejects anything
+// outside this set with a clear error so unsupported types (e.g. VARCHAR) fail
+// early rather than producing silent garbage.
 static bool IsLTTBSupportedType(const LogicalType &type) {
 	switch (type.id()) {
 	case LogicalTypeId::DOUBLE:
@@ -452,6 +455,9 @@ static void LTTBInitialize(const AggregateFunction &, data_ptr_t state) {
 	lttb_state.has_buckets = false;
 }
 
+// Accumulate valid (non-NaN) (x, y) points into the per-group state vector.
+// Type dispatch is hoisted to bind-time function pointers so the row loop
+// avoids a per-row switch.
 static void LTTBUpdate(Vector inputs[], AggregateInputData &input_data, idx_t input_count, Vector &state_vector,
                        idx_t count) {
 	D_ASSERT(input_count == 3);
@@ -517,6 +523,9 @@ static void LTTBUpdate(Vector inputs[], AggregateInputData &input_data, idx_t in
 	}
 }
 
+// Merge partial per-partition states. When the target is empty the source
+// vector pointer is transferred in O(1) (and nulled in the source to prevent
+// double-free in LTTBDestroy); otherwise reserve+insert.
 static void LTTBCombine(Vector &state_vector, Vector &combined, AggregateInputData &, idx_t count) {
 	UnifiedVectorFormat source_data;
 	UnifiedVectorFormat target_data;
@@ -558,6 +567,9 @@ static void LTTBCombine(Vector &state_vector, Vector &combined, AggregateInputDa
 	}
 }
 
+// Run LTTB over each group's accumulated points and write the typed
+// STRUCT(x, y)[] result. Downsample may mutate (sort, or move when n<=buckets)
+// since Finalize is the terminal consumer of the state vector.
 static void LTTBFinalize(Vector &state_vector, AggregateInputData &input_data, Vector &result, idx_t count,
                          idx_t offset) {
 	UnifiedVectorFormat state_data;
@@ -627,6 +639,8 @@ static void LTTBIndicesFinalize(Vector &state_vector, AggregateInputData &input_
 	ListVector::SetListSize(result, total_size);
 }
 
+// Free the owning points vector for each state. LTTBState uses a raw pointer
+// (DuckDB aggregate convention); this is the designated cleanup point.
 static void LTTBDestroy(Vector &state_vector, AggregateInputData &, idx_t count) {
 	UnifiedVectorFormat state_data;
 	state_vector.ToUnifiedFormat(count, state_data);
@@ -760,6 +774,10 @@ struct MinMaxLTTBFunctionData : public FunctionData {
 	}
 };
 
+// Accumulate valid points into the shared LTTBState, packing n_out and the
+// per-group minmax_ratio into state.buckets (low 32 bits = n_out, high 32 =
+// ratio) so Finalize can recover both without extra state. Rejects ratio<=1
+// and non-constant ratio within a group.
 static void MinMaxLTTBUpdate(Vector inputs[], AggregateInputData &input_data, idx_t input_count,
                              Vector &state_vector, idx_t count) {
 	D_ASSERT(input_count == 4);
@@ -841,6 +859,10 @@ static void MinMaxLTTBUpdate(Vector inputs[], AggregateInputData &input_data, id
 	}
 }
 
+// Two-stage finalize: bin-first MinMax preselect (argmin/argmax of y per
+// equi-width x-range bin) shrinks the full dataset to ~n*ratio candidates,
+// then LTTB runs over the candidates. Degenerate cases (n<=n_out, ratio<=1,
+// n/ratio<=n_out) bypass preselect and run standard LTTB directly.
 static void MinMaxLTTBFinalize(Vector &state_vector, AggregateInputData &input_data, Vector &result, idx_t count,
                                idx_t offset) {
 	UnifiedVectorFormat state_data;
@@ -1110,6 +1132,9 @@ struct BucketStatsFunctionData : public FunctionData {
 	}
 };
 
+// Accumulate valid points into the shared LTTBState. Reuses the same state as
+// lttb/minmax_lttb so the aggregate framework can combine them uniformly;
+// bucketing and stats computation happen in Finalize.
 static void BucketStatsUpdate(Vector inputs[], AggregateInputData &input_data, idx_t input_count,
                               Vector &state_vector, idx_t count) {
 	D_ASSERT(input_count == 3);
@@ -1169,6 +1194,8 @@ static void BucketStatsUpdate(Vector inputs[], AggregateInputData &input_data, i
 	}
 }
 
+// Output schema: one struct per bucket with range (typed x), count, and y
+// stats. min/max/first/last preserve y_type; mean/std are DOUBLE.
 static LogicalType BucketStatsReturnType(const LogicalType &x_type, const LogicalType &y_type) {
 	child_list_t<LogicalType> struct_children;
 	struct_children.emplace_back("bucket_start", x_type);
@@ -1183,6 +1210,9 @@ static LogicalType BucketStatsReturnType(const LogicalType &x_type, const Logica
 	return LogicalType::LIST(LogicalType::STRUCT(std::move(struct_children)));
 }
 
+// Compute per-bucket distribution stats (count, min, max, mean, std, first,
+// last) over y using equal-count-by-index bucketing (same formula as LTTB).
+// No sort or triangle computation — a single linear scan per bucket.
 static void BucketStatsFinalize(Vector &state_vector, AggregateInputData &input_data, Vector &result, idx_t count,
                                 idx_t offset) {
 	UnifiedVectorFormat state_data;
@@ -1343,6 +1373,8 @@ static AggregateFunction GetBucketStatsConcreteFunction(const string &name, cons
 	                         FunctionNullHandling::SPECIAL_HANDLING, nullptr, nullptr, LTTBDestroy);
 }
 
+// Resolve x/y types and read/write function pointers at bind time. Mirrors the
+// lttb/minmax_lttb bind shape; bucket_stats has no sorted flag or ratio.
 static unique_ptr<FunctionData> BucketStatsBindFunction(ClientContext &, AggregateFunction &function,
                                                         vector<unique_ptr<Expression>> &arguments) {
 	for (auto &argument : arguments) {
@@ -1372,6 +1404,8 @@ static AggregateFunction GetBucketStatsFunction(const string &name) {
 
 } // namespace
 
+// Register all extension aggregate functions. largestTriangleThreeBuckets is
+// an alias for lttb for ClickHouse syntax familiarity.
 static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(GetLTTBFunction("lttb"));
 	loader.RegisterFunction(GetLTTBFunction("largestTriangleThreeBuckets"));
