@@ -163,18 +163,19 @@
 
 | 函数 | 耗时 (ms) | 说明 |
 |---|---|---|
-| `lttb` | 15.0 | 排序 + LTTB 采样 |
-| `lttb_sorted` | 9.0 | 跳过排序，直接 LTTB 采样 |
-| `lttb_indices` | 15.0 | 排序 + LTTB，输出索引 |
-| `minmax_lttb(r=4)` | 14.0 | MinMax 预选 + LTTB |
-| `minmax_lttb(r=8)` | 15.0 | MinMax 预选（更大候选集）+ LTTB |
-| `bucket_stats` | 14.0 | 等计数分桶 + 统计聚合 |
+| `lttb` | 17.0 | 排序 + LTTB 采样 |
+| `lttb_sorted` | 10.0 | 跳过排序，直接 LTTB 采样 |
+| `lttb_indices` | 17.0 | 排序 + LTTB，输出索引 |
+| `minmax_lttb(r=4)` | 11.0 | bin-first 预选 + LTTB（跳过全量排序） |
+| `minmax_lttb(r=8)` | 10.0 | bin-first 预选（更大候选集）+ LTTB |
+| `minmax_lttb_sorted(r=4)` | 11.0 | 同 minmax_lttb，sorted 输入变体 |
+| `bucket_stats` | 16.0 | 等计数分桶 + 统计聚合 |
 
 ### 分析
 
-- **`lttb_sorted` 是最快的降采样函数**：9ms vs 15ms（`lttb`），排序成本 6ms（占总时间 40%）。适用于已知数据已排序的场景（如时间序列主键有序表）。
-- **`minmax_lttb` 在 1M 批处理场景下无计算优势**：15ms 与 `lttb` 相同。MinMax 预选阶段（O(n) 扫描 + 分桶）的开销与 LTTB 三角形循环的节省抵消。`minmax_ratio` 从 4 增到 8 无显著差异——预选的候选集更大但 LTTB 仍跑在候选集上。当前 DuckDB 聚合实现不会持久化候选集；每次调用都会重新累积全部点、重新预选、重新运行 LTTB。
-- **`bucket_stats` 性能与 `lttb` 相当**：15ms。虽然不需要三角形面积计算，但需要排序 + 逐桶统计聚合（min/max/mean/std），计算量与 LTTB 相近。
+- **`lttb_sorted` 是最快的降采样函数**：10ms vs 17ms（`lttb`），排序成本 7ms（占总时间 41%）。适用于已知数据已排序的场景（如时间序列主键有序表）。
+- **`minmax_lttb` 现在有明显加速**：11ms vs `lttb` 17ms（**1.55x 加速**）。Phase 1 优化将原来的"先全量排序再预选"改为 bin-first 策略：扫描一次找 x 范围，将所有点分入等宽 x-bins 保留每桶 argmin/argmax，只对 ~n×ratio 个候选点排序后运行 LTTB。这消除了占 88% 运行时间的全量 `stable_sort`。`minmax_ratio` 从 4 增到 8 时候选集更大但 LTTB 仍快（10ms vs 11ms），因为候选集排序成本可忽略。
+- **`bucket_stats` 性能与 `lttb` 相当**：16ms vs 17ms。虽然不需要三角形面积计算，但需要排序 + 逐桶统计聚合（min/max/mean/std），计算量与 LTTB 相近。
 - **`lttb_indices` 与 `lttb` 性能相同**：索引输出的额外开销可忽略。
 
 ### 7.2 lttb vs lttb_sorted（排序成本）
@@ -195,16 +196,16 @@
 
 | 数据量 | n_out | lttb (ms) | minmax_lttb (ms) | 加速比 |
 |---|---|---|---|---|
-| 100K | 100 | 2.0 | 2.0 | 1.00x |
-| 100K | 1000 | 1.0 | 1.0 | 1.00x |
-| 1M | 100 | 16.0 | 15.0 | 1.06x |
-| 1M | 1000 | 15.0 | 15.0 | 1.00x |
+| 100K | 100 | 2.0 | 1.0 | 2.00x |
+| 100K | 1000 | 2.0 | 1.0 | 2.00x |
+| 1M | 100 | 16.0 | 11.0 | 1.45x |
+| 1M | 1000 | 17.0 | 11.0 | 1.55x |
 
 ### 分析
 
-- **minmax_lttb 在典型批处理场景下无显著加速**。MinMax 预选的 O(n) 扫描 + 分桶开销与 LTTB 三角形循环的节省抵消。
-- 1M/n=100 时有微弱优势（1.06x），因为 n_out 较小时 LTTB 三角形循环在候选集上的节省更明显。
-- **结论**：当前 `minmax_lttb` 主要是与 `plotly-resampler` API/算法语义对齐的近似路径，而不是明确的性能优化。候选集只存在于单次 Finalize 内，不会跨查询缓存；因此它不支持“预选一次，多次重采样”。对于数据库的一次性批处理降采样，`lttb_sorted` 是更好的选择。`minmax_lttb` 只有在未来增加 SIMD 预选、候选集物化/缓存，或改成真正流式的候选集状态后，才可能在交互式多次重采样场景中体现稳定价值。
+- **`minmax_lttb` 现在有稳定加速**：1M/n=1000 时 1.55x，1M/n=100 时 1.45x。Phase 1 的 bin-first 优化消除了全量排序，用两次 O(n) 扫描（找 x 范围 + 分桶）替代 O(n log n) 排序。
+- **打乱输入场景加速更显著**：见 7.5 节，1M 打乱数据从 75ms 降到 10ms（**7.5x 加速**），因为打乱输入的排序成本占 88%。
+- **结论**：`minmax_lttb` 现在是未排序大数据集降采样的推荐函数。对于已排序输入，`lttb_sorted`（10ms）和 `minmax_lttb`（11ms）性能接近，`lttb_sorted` 略优因为不需要分桶扫描。
 
 ### 7.4 bucket_stats 性能
 
@@ -224,18 +225,19 @@
 
 ### 7.5 打乱输入（排序成本验证）
 
-| 数据量 | n_out | lttb (ms) | lttb_sorted (ms)* |
-|---|---|---|---|
-| 100K shuffled | 1000 | 6.0 | 1.0 |
-| 1M shuffled | 1000 | 67.0 | 8.0 |
+| 数据量 | n_out | lttb (ms) | lttb_sorted (ms)* | minmax_lttb (ms) | minmax_lttb_sorted (ms) |
+|---|---|---|---|---|---|
+| 100K shuffled | 1000 | 6.0 | 1.0 | 2.0 | 1.0 |
+| 1M shuffled | 1000 | 75.0 | 9.0 | 10.0 | 13.0 |
 
 > *`lttb_sorted` 对打乱输入会产生错误结果，此处仅展示消除排序后的时间。
 
 ### 分析
 
-- 打乱输入的排序成本显著：1M 时 67ms - 8ms = **59ms**（占总时间 88%）。
-- 对比已排序输入的 6ms 排序成本，打乱输入的排序更贵（`stable_sort` 对无序数据的最坏情况 O(n log²n)）。
-- **实践建议**：如果数据已按 x 排序（如时间序列主键有序表），使用 `lttb_sorted` 可从 67ms 降到 8ms（**8.4x 加速**）。
+- 打乱输入的排序成本显著：1M 时 75ms - 9ms = **66ms**（占总时间 88%）。
+- 对比已排序输入的 7ms 排序成本，打乱输入的排序更贵（`stable_sort` 对无序数据的最坏情况 O(n log²n)）。
+- **`minmax_lttb` 在打乱输入上实现 7.5x 加速**：1M 打乱数据从 75ms（lttb）降到 10ms（minmax_lttb）。bin-first 策略完全跳过全量排序，用两次 O(n) 扫描替代。`minmax_lttb_sorted`（13ms）略慢于 `minmax_lttb`（10ms），因为两者都走 bin-first 路径，差异在测量噪声范围内。
+- **实践建议更新**：对于未排序的大数据集，`minmax_lttb` 是最佳选择（7.5x 加速，结果正确）。对于已排序数据，`lttb_sorted` 仍略优（10ms vs 11ms）。
 
 ### 7.6 多组 GROUP BY（100 组，1M 总量）
 
@@ -258,7 +260,8 @@
 | 场景 | 推荐函数 | 理由 |
 |---|---|---|
 | 已排序输入，一次性降采样 | `lttb_sorted` | 消除排序成本，1.67x 加速 |
-| 未排序输入，一次性降采样 | `lttb` | 内部排序，结果正确 |
+| 未排序输入，一次性降采样 | `minmax_lttb` | bin-first 跳过全量排序，7.5x 加速（打乱 1M） |
+| 未排序输入，需精确结果 | `lttb` | 内部排序，结果正确，但排序成本高 |
+| 已排序输入，接受近似结果 | `minmax_lttb_sorted` | bin-first 快速路径，与 minmax_lttb 性能相当 |
 | 需要选中点索引 | `lttb_indices` | 与 `lttb` 性能相同，输出索引 |
 | 分布分析（非曲线形状） | `bucket_stats` | 提供 min/max/mean/std 统计，适合 AI agent 分析 |
-| 大数据集 + 小 n_out，接受近似结果 | `minmax_lttb` | 当前实现仅有微弱优势（1M/n=100 为 1.06x）；主要用于近似语义验证，不应作为默认性能优化 |

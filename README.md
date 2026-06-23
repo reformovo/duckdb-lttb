@@ -8,6 +8,7 @@ largestTriangleThreeBuckets(x, y, n)
 lttb_sorted(x, y, n)
 lttb_indices(x, y, n)
 minmax_lttb(x, y, n, minmax_ratio)
+minmax_lttb_sorted(x, y, n, minmax_ratio)
 bucket_stats(x, y, num_buckets)
 ```
 
@@ -22,6 +23,7 @@ The behavior is modeled after ClickHouse `largestTriangleThreeBuckets` / `lttb`.
 | `lttb_sorted(x, y, n)` | Same as `lttb` but skips the sort. Caller must guarantee input is already ordered by `x`. |
 | `lttb_indices(x, y, n)` | Same selection as `lttb` but returns `BIGINT[]` of selected sorted-position indices instead of points. |
 | `minmax_lttb(x, y, n, minmax_ratio)` | Two-stage MinMax preselection + LTTB. `minmax_ratio` defaults to 4 (NULL). Reduces the LTTB triangle loop to ~`n * minmax_ratio` candidates. Approximate, not exact LTTB. |
+| `minmax_lttb_sorted(x, y, n, minmax_ratio)` | Same as `minmax_lttb` but caller guarantees input is already ordered by `x`. Uses the bin-first fast path. |
 | `bucket_stats(x, y, num_buckets)` | Per-bucket statistical downsampling. Returns `STRUCT(bucket_start, bucket_end, count, min, max, mean, std, first, last)[]` with y-only stats and x range boundaries. |
 
 ### Supported Input Types
@@ -37,8 +39,15 @@ The output preserves both `x` and `y` types: `STRUCT(x typed, y typed)[]`, match
 - `minmax_ratio` defaults to 4 (pass `NULL` for the default). `minmax_ratio <= 1` is rejected.
 - When `n / minmax_ratio <= n_out`, degenerates to standard LTTB (no preselect).
 - Both `n` and `minmax_ratio` must be constant within each aggregate group.
-- **Note**: In DuckDB's aggregate model, all points are accumulated in Update (O(n) memory), and the candidate set is temporary inside a single Finalize call. It is not cached across queries. Benchmarks show no clear speedup for typical batch workloads because the O(n) MinMax preselect scan offsets the smaller LTTB triangle loop.
+- **Note**: Uses a bin-first algorithm that avoids sorting the full dataset. Instead of sort-then-preselect, it scans once for x-range, bins all points into equi-width x-bins keeping argmin/argmax of y per bin, then sorts only the ~`n * minmax_ratio` candidates before running LTTB. This eliminates the O(n log n) full sort (88% of runtime on shuffled data), achieving **7.5x speedup** over `lttb` on shuffled 1M input and **1.5x** on sorted input. Memory is still O(n) (all points accumulated in Update); the candidate set is temporary inside Finalize.
 - Output preserves input types, matching `lttb`/`lttb_sorted`.
+
+### minmax_lttb_sorted
+
+`minmax_lttb_sorted(x, y, n, minmax_ratio)` is the sorted-input variant of `minmax_lttb`. Caller must guarantee input is already ordered by `x`. Uses the same bin-first fast path as `minmax_lttb` — since bin-first does not require sorted input, both variants achieve similar performance. The `sorted` flag is retained for API parity with `lttb_sorted`.
+
+- Same `minmax_ratio` semantics as `minmax_lttb` (default 4, NULL for default, <= 1 rejected).
+- Output preserves input types, matching `minmax_lttb`.
 
 ### bucket_stats
 

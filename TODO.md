@@ -186,32 +186,34 @@ operate on doubles internally; type conversion happens at I/O boundaries.
     - `n / minmax_ratio <= n`: degenerates to standard LTTB
   - **Implementation**: Two-stage Finalize reusing LTTBState (accumulate all
     points in Update, MinMax preselect in Finalize → LTTB on candidates).
-    NOTE: NO memory win in DuckDB's aggregate model (O(n) accumulation), and
-    the candidate set is not persisted across queries. Benchmarks show no
-    clear compute win for typical batch workloads because the O(n) preselect
-    scan offsets the smaller LTTB triangle loop. Equi-width x-range bins; per
-    bin keep argmin(y)/argmax(y); first/last always preserved.
+    **Phase 1 optimization (2026-06-23)**: Replaced the "sort-all-then-preselect"
+    approach with a bin-first strategy that avoids sorting the full dataset. The
+    new Finalize scans once for x_min/x_max, bins all points into equi-width
+    x-bins keeping argmin/argmax of y per bin, then sorts only the ~n×ratio
+    candidates before running LTTB. This eliminates the O(n log n) full sort
+    (88% of runtime on shuffled data), achieving 7.5x speedup on shuffled 1M
+    input and 1.5x on sorted input. Memory is still O(n) (all points accumulated
+    in Update); the candidate set is temporary inside Finalize.
   - **Document**: This is approximate, not exact LTTB.
-  - **Status**: implemented; speculative for typical batch workloads —
-    benchmark post-hoc to confirm value.
+  - **Status**: implemented and optimized; bin-first delivers stable speedup
+    over `lttb` for both sorted (1.5x) and shuffled (7.5x) inputs.
 
 ### MinMaxLTTB follow-up optimization candidates
 
-- [ ] Add `minmax_lttb_sorted(x, y, n, minmax_ratio)` fast path
-  - Current `minmax_lttb` always sorts before MinMax preselection. PulseOn's
-    `metric_points` path is naturally ordered by `step`, so a sorted-input
-    variant can skip `stable_sort` just like `lttb_sorted`.
-  - Expected value: deterministic sort-elimination win for the only realistic
-    PulseOn use case. This should be attempted before lower-level SIMD work.
+- [x] Add `minmax_lttb_sorted(x, y, n, minmax_ratio)` fast path
+  - Added `minmax_lttb_sorted` as the sorted-input variant of `minmax_lttb`. Uses
+    the same bin-first fast path as `minmax_lttb` — since bin-first does not require
+    sorted input, both variants achieve similar performance. The `sorted` flag is
+    retained for API parity with `lttb_sorted`.
 
 - [ ] SIMD/vectorize MinMax preselection (`argminmax` parity with tsdownsample)
-  - Benchmarks show `tsdownsample` MinMaxLTTB is 1.4-2.0x faster than LTTB when
-    `size / n_out` is large, while this C++ implementation is ~1.0x. The likely
-    gap is `tsdownsample`'s SIMD-optimized `argminmax` preselection.
+  - After Phase 1 bin-first optimization, the binning scan is ~2ms on 1M points
+    (the new bottleneck after eliminating the full sort). SIMD argmin/argmax
+    could reduce this to ~1ms.
   - Implement AVX2 (x86) / NEON (ARM) / scalar fallback for per-bin `argmin(y)`
-    and `argmax(y)`, preserving original sorted indices and tail handling.
-  - Acceptance gate: demonstrate a stable >1.25x speedup over `lttb_sorted` or
-    `lttb` for 1M→100/1000 and 5M→100/1000 scenarios before recommending it.
+    and `argmax(y)`, preserving original indices and tail handling.
+  - Acceptance gate: demonstrate a stable >1.25x speedup over the current
+    bin-first `minmax_lttb` for 1M→100/1000 scenarios before recommending it.
 
 - [ ] Evaluate candidate-set materialization/cache API
   - Current `minmax_lttb` candidate vectors are temporary inside Finalize and are
@@ -348,15 +350,49 @@ operate on doubles internally; type conversion happens at I/O boundaries.
 - Parked "Combine multi-way merge": current `reserve + insert` is sufficient
   for PulseOn Native (single partition). Cloud version uses ClickHouse, not
   this extension. Revisit only if multi-partition combine becomes a bottleneck.
+- Dropped "Rewrite extension in Rust + Polars" (2026-06-23 decision): the
+  `minmax_lttb` performance problem was diagnosed as an algorithm-structure
+  issue (full-dataset `stable_sort` consuming 88% of runtime on shuffled
+  input), not a language issue. Phase 1 bin-first optimization in C++
+  (~120 lines) eliminated the full sort and achieved 7.5x speedup on shuffled
+  1M input — proving the bottleneck was algorithmic. Polars is a standalone
+  columnar engine competing with DuckDB, not a library embeddable in a DuckDB
+  extension; "Rust + Polars" would mean abandoning the DuckDB/SQL interface
+  (a product pivot), not a language swap. DuckDB extensions can be written in
+  Rust via the C Extension API (`quack-rs`, production-grade since DuckDB
+  v1.1), but rewriting in Rust would yield the same algorithmic ceiling as
+  C++ for this workload. LTTB is inherently sequential (each bucket's
+  selection depends on the previous bucket's); language choice does not
+  change a sequential algorithm's throughput. Decision: stay in C++, fix the
+  algorithm. Revisit only if a compelling non-performance reason for Rust
+  emerges (e.g., memory safety requirements, ecosystem integration).
+- Dropped "Switch `lttb()` from `std::stable_sort` to `std::sort`" (2026-06-23
+  decision): measured the delta on Apple Silicon (best of 9):
+  - shuffled 1M, n=1000: stable_sort 73ms → std::sort 69ms (4ms / 5.5%)
+  - shuffled 1M, n=100: 74ms → 69ms (5ms / 6.8%)
+  - sorted 1M, n=1000: 17ms → 15ms (2ms / 12%)
+  The ~4-5ms saving on the `lttb()` path is noise-level compared to
+  `minmax_lttb`'s bin-first 63ms advantage (73ms → 10ms). `lttb()` is now the
+  exact-result fallback path; users wanting speed use `minmax_lttb`, users
+  wanting determinism on pre-sorted data use `lttb_sorted`. Switching to
+  `std::sort` would downgrade the cross-platform determinism contract
+  (introsort's equal-x ordering is implementation-defined) for a 6% gain on a
+  non-recommended path. The `lttb_dup_x` tests depend on stable ordering.
+  Decision: keep `std::stable_sort` at all three sites:
+  - `Downsample()` (`lttb()` full sort) — determinism is a feature
+  - `MinMaxLTTBFinalize()` (bin-first candidate sort) — negligible
+    perf difference on ~4000 candidates; stability is harmless
+  - `BucketStatsFinalize()` (`bucket_stats`) — `first`/`last`
+    output values directly depend on sort order; stability is required
 
 ## Recommended Next Steps
 
 Most P0-P3 items are complete. The remaining unchecked items are optimization
 follow-ups or deferred controls:
 
-1. **`minmax_lttb_sorted`** (P1/P2): add a sorted-input fast path before any
-   lower-level MinMaxLTTB work. This is the most likely practical improvement
-   for PulseOn because `metric_points` is ordered by `step`.
+1. **`minmax_lttb_sorted`** (P1/P2): **DONE** — added sorted-input variant
+   using the bin-first fast path. Both `minmax_lttb` and `minmax_lttb_sorted`
+   now achieve 7.5x speedup on shuffled 1M input and 1.5x on sorted input.
 2. **SIMD/vectorized MinMax preselection** (P2): close the gap with
    `tsdownsample` only if benchmarks show >1.25x speedup on large-input/small-
    `n_out` scenarios.

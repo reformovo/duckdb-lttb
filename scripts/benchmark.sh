@@ -276,6 +276,10 @@ QUERY="$LOAD SELECT count(*) FROM (SELECT unnest(minmax_lttb(x, y, 1000, 8)) FRO
 T=$(bench_duckdb "$SETUP_SORTED" "$QUERY")
 printf "%-18s %12s\n" "minmax_lttb(r=8)" "$T"
 
+QUERY="$LOAD SELECT count(*) FROM (SELECT unnest(minmax_lttb_sorted(x, y, 1000, 4)) FROM b);"
+T=$(bench_duckdb "$SETUP_SORTED" "$QUERY")
+printf "%-18s %12s\n" "minmax_lttb_sorted(r=4)" "$T"
+
 QUERY="$LOAD SELECT count(*) FROM (SELECT unnest(bucket_stats(x, y, 1000)) FROM b);"
 T=$(bench_duckdb "$SETUP_SORTED" "$QUERY")
 printf "%-18s %12s\n" "bucket_stats" "$T"
@@ -335,6 +339,34 @@ for SIZE in 100000 1000000; do
 done
 
 echo ""
+echo "--- shuffled input (bin-first sort elimination) ---"
+echo ""
+printf "%-18s %6s %12s %12s %12s\n" "Dataset" "n_out" "lttb(ms)" "minmax(ms)" "Speedup"
+printf "%-18s %6s %12s %12s %12s\n" "................" "......" "............" "............" "............"
+echo "------------------------------------------------------------------------"
+
+for SIZE in 100000 1000000; do
+    for N in 100 1000; do
+        LABEL="$((SIZE / 1000))K shuf"
+
+        SETUP="$LOAD CREATE TABLE b AS SELECT x, y FROM (SELECT i::DOUBLE AS x, sin(i/${SIZE}.0)::DOUBLE AS y FROM range(${SIZE}) AS t(i)) ORDER BY random();"
+        Q_LTTB="$LOAD SELECT count(*) FROM (SELECT unnest(lttb(x, y, ${N})) FROM b);"
+        Q_MINMAX="$LOAD SELECT count(*) FROM (SELECT unnest(minmax_lttb(x, y, ${N}, 4)) FROM b);"
+
+        T_LTTB=$(bench_duckdb "$SETUP" "$Q_LTTB")
+        T_MINMAX=$(bench_duckdb "$SETUP" "$Q_MINMAX")
+
+        if (( $(echo "$T_MINMAX > 0" | bc -l) )); then
+            SPEEDUP=$(echo "scale=2; $T_LTTB / $T_MINMAX" | bc -l)
+        else
+            SPEEDUP="N/A"
+        fi
+
+        printf "%-18s %6s %12s %12s %12sx\n" "$LABEL" "$N" "$T_LTTB" "$T_MINMAX" "$SPEEDUP"
+    done
+done
+
+echo ""
 
 # --- Section 8: bucket_stats at multiple scales ---
 echo "=== Section 8: bucket_stats performance ==="
@@ -360,10 +392,11 @@ echo ""
 # --- Section 9: Shuffled input (lttb sort cost) ---
 echo "=== Section 9: Shuffled input (sort cost) ==="
 echo ""
-printf "%-18s %6s %12s %12s\n" "Dataset" "n_out" "lttb(ms)" "sorted(ms)*"
-printf "%-18s %6s %12s %12s\n" "................" "......" "............" "............"
-echo "----------------------------------------------------------------"
+printf "%-18s %6s %12s %12s %12s %12s\n" "Dataset" "n_out" "lttb(ms)" "sorted(ms)*" "minmax(ms)" "mm_sorted(ms)"
+printf "%-18s %6s %12s %12s %12s %12s\n" "................" "......" "............" "............" "............" "............"
+echo "--------------------------------------------------------------------------------------------------------"
 echo "(* lttb_sorted on shuffled input gives WRONG results but shows sort-eliminated time)"
+echo "(minmax_lttb and minmax_lttb_sorted use bin-first: correct results on shuffled input)"
 
 for SIZE in 100000 1000000; do
     N=1000
@@ -372,11 +405,15 @@ for SIZE in 100000 1000000; do
     SETUP="$LOAD CREATE TABLE b AS SELECT x, y FROM (SELECT i::DOUBLE AS x, sin(i/${SIZE}.0)::DOUBLE AS y FROM range(${SIZE}) AS t(i)) ORDER BY random();"
     Q_LTTB="$LOAD SELECT count(*) FROM (SELECT unnest(lttb(x, y, ${N})) FROM b);"
     Q_SORTED="$LOAD SELECT count(*) FROM (SELECT unnest(lttb_sorted(x, y, ${N})) FROM b);"
+    Q_MINMAX="$LOAD SELECT count(*) FROM (SELECT unnest(minmax_lttb(x, y, ${N}, 4)) FROM b);"
+    Q_MM_SORTED="$LOAD SELECT count(*) FROM (SELECT unnest(minmax_lttb_sorted(x, y, ${N}, 4)) FROM b);"
 
     T_LTTB=$(bench_duckdb "$SETUP" "$Q_LTTB")
     T_SORTED=$(bench_duckdb "$SETUP" "$Q_SORTED")
+    T_MINMAX=$(bench_duckdb "$SETUP" "$Q_MINMAX")
+    T_MM_SORTED=$(bench_duckdb "$SETUP" "$Q_MM_SORTED")
 
-    printf "%-18s %6s %12s %12s\n" "$LABEL" "$N" "$T_LTTB" "$T_SORTED"
+    printf "%-18s %6s %12s %12s %12s %12s\n" "$LABEL" "$N" "$T_LTTB" "$T_SORTED" "$T_MINMAX" "$T_MM_SORTED"
 done
 
 echo ""
@@ -399,6 +436,10 @@ done
 QUERY="$LOAD SELECT count(*) FROM (SELECT unnest(minmax_lttb(x, y, 100, 4)) FROM b GROUP BY g);"
 T=$(bench_duckdb "$SETUP_GROUP" "$QUERY")
 printf "%-18s %12s\n" "minmax_lttb(r=4)" "$T"
+
+QUERY="$LOAD SELECT count(*) FROM (SELECT unnest(minmax_lttb_sorted(x, y, 100, 4)) FROM b GROUP BY g);"
+T=$(bench_duckdb "$SETUP_GROUP" "$QUERY")
+printf "%-18s %12s\n" "minmax_lttb_sorted(r=4)" "$T"
 
 QUERY="$LOAD SELECT count(*) FROM (SELECT unnest(bucket_stats(x, y, 100)) FROM b GROUP BY g);"
 T=$(bench_duckdb "$SETUP_GROUP" "$QUERY")

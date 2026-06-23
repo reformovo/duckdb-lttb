@@ -42,12 +42,9 @@ struct LTTBState {
 	bool has_buckets = false;
 };
 
-// Type-dispatched read/write function pointers. Resolved once at bind time so
-// the per-row Update/Finalize loops call a single indirect function instead of
-// a 20-case switch on type.id() per row.
-// NOTE: These are bare function pointers (trivially copyable, no stateful
-// captures) so LTTBFunctionData::Copy() remains correct. Do not replace with
-// std::function or stateful lambdas.
+// Type-dispatched read/write function pointers, resolved once at bind time so
+// per-row loops avoid a switch on type.id(). Bare pointers (trivially
+// copyable) — do not replace with std::function or stateful lambdas.
 using ReadFunc = double (*)(const UnifiedVectorFormat &, idx_t, const LogicalType &);
 using WriteFunc = void (*)(Vector &, idx_t, double, const LogicalType &);
 
@@ -79,10 +76,8 @@ static bool IsValidPoint(double x, double y) {
 	return !std::isnan(x) && !std::isnan(y);
 }
 
-// Resolve the type-specific read function at bind time. The returned function
-// pointer captures the type dispatch so the per-row loop avoids a 20-case
-// switch. DECIMAL still reads scale from the LogicalType (an inline accessor,
-// not a dispatch).
+// Resolve the type-specific read function at bind time. DECIMAL reads scale
+// from the LogicalType (inline accessor, not a dispatch).
 static ReadFunc MakeReader(const LogicalType &type) {
 	switch (type.id()) {
 	case LogicalTypeId::DOUBLE:
@@ -334,12 +329,10 @@ static bool IsLTTBSupportedType(const LogicalType &type) {
 	}
 }
 
-// Downsample the given points to `buckets` using the LTTB algorithm.
-// NOTE: This function mutates `points` in place (sorts it) and may std::move
-// it entirely when n <= buckets. This is safe because LTTBFinalize is the
-// terminal consumer of the state vector.
-// If `out_indices` is non-null, fills it with the 0-based sorted-position
-// indices of the selected points (for lttb_indices output).
+// Downsample `points` to `buckets` via LTTB. Mutates `points` in place (sorts
+// it; may std::move it when n <= buckets — safe as Finalize is the terminal
+// consumer). If `out_indices` is non-null, fills it with selected sorted-position
+// indices (for lttb_indices).
 static std::vector<LTTBPoint> Downsample(std::vector<LTTBPoint> &points, uint64_t buckets, bool skip_sort = false,
                                         std::vector<idx_t> *out_indices = nullptr) {
 	// No buckets requested — return empty immediately, no sorting needed.
@@ -731,108 +724,11 @@ static AggregateFunction GetLTTBIndicesFunction(const string &name) {
 }
 
 // ---------------------------------------------------------------------------
-// minmax_lttb: two-stage MinMax preselection + LTTB.
-//
-// Reference: plotly-resampler MinMaxLTTB / tsdownsample minmaxlttb_generic.
-// Stage 1 (MinMax preselect): divide interior points into n_minmax_buckets
-//   equi-width x-range bins; per bin keep argmin(y) and argmax(y). Bins with
-//   <=2 points keep all. First/last points of the whole series are preserved.
-// Stage 2: run LTTB over the reduced candidate set.
-//
-// NOTE: In DuckDB's aggregate model, all points are accumulated in Update
-// (O(n) memory) — there is NO memory win vs standard LTTB. The win is compute:
-// the LTTB triangle loop runs on ~n*minmax_ratio candidates instead of n.
+// minmax_lttb: MinMax preselection + LTTB. Reference: plotly-resampler
+// MinMaxLTTB. Bin-first preselect keeps argmin(y)/argmax(y) per equi-width
+// x-range bin, then runs LTTB on the reduced candidate set. See
+// docs/architecture.md §4.7 for the algorithm and complexity analysis.
 // ---------------------------------------------------------------------------
-
-// MinMax preselection: from a sorted points vector, build a candidate set of
-// indices by keeping argmin(y)/argmax(y) per equi-width x-range bin. First and
-// last points are always included. Returns candidate indices into `points`.
-static std::vector<idx_t> MinMaxPreselect(const std::vector<LTTBPoint> &points, uint64_t n_minmax_buckets) {
-	const auto n = points.size();
-	if (n <= 2) {
-		std::vector<idx_t> result;
-		result.reserve(n);
-		for (idx_t i = 0; i < n; i++) {
-			result.push_back(i);
-		}
-		return result;
-	}
-
-	// n_minmax_buckets is the number of MinMax bins over the interior points.
-	// Each bin contributes up to 2 candidates (argmin/argmax of y).
-	std::vector<idx_t> candidates;
-	candidates.push_back(0); // always keep first
-
-	const double x_min = points[0].x;
-	const double x_max = points[n - 1].x;
-	const double x_range = x_max - x_min;
-	const idx_t interior_start = 1;
-	const idx_t interior_end = n - 1; // exclusive
-
-	if (x_range <= 0.0 || n_minmax_buckets == 0) {
-		// Degenerate: x all equal or no bins — keep all interior points.
-		for (idx_t i = interior_start; i < interior_end; i++) {
-			candidates.push_back(i);
-		}
-		candidates.push_back(n - 1);
-		return candidates;
-	}
-
-	const double x_step = x_range / static_cast<double>(n_minmax_buckets);
-	idx_t bin_start = interior_start;
-	for (uint64_t bin = 0; bin < n_minmax_buckets; bin++) {
-		const double bin_left = x_min + static_cast<double>(bin) * x_step;
-		const double bin_right = x_min + static_cast<double>(bin + 1) * x_step;
-		// Find [bin_start, bin_end) where x in [bin_left, bin_right).
-		// Points are sorted by x; advance bin_start to first point >= bin_left.
-		while (bin_start < interior_end && points[bin_start].x < bin_left) {
-			bin_start++;
-		}
-		idx_t bin_end = bin_start;
-		while (bin_end < interior_end && points[bin_end].x < bin_right) {
-			bin_end++;
-		}
-		if (bin_end <= bin_start) {
-			continue; // empty bin
-		}
-		const auto bin_count = bin_end - bin_start;
-		if (bin_count <= 2) {
-			// Keep all points in small bins.
-			for (idx_t i = bin_start; i < bin_end; i++) {
-				candidates.push_back(i);
-			}
-		} else {
-			// Find argmin and argmax of y within [bin_start, bin_end).
-			idx_t min_idx = bin_start;
-			idx_t max_idx = bin_start;
-			double min_y = points[bin_start].y;
-			double max_y = points[bin_start].y;
-			for (idx_t i = bin_start + 1; i < bin_end; i++) {
-				const double y = points[i].y;
-				if (y < min_y) {
-					min_y = y;
-					min_idx = i;
-				}
-				if (y > max_y) {
-					max_y = y;
-					max_idx = i;
-				}
-			}
-			// Push in sorted order (min_idx and max_idx may be in either order).
-			if (min_idx <= max_idx) {
-				candidates.push_back(min_idx);
-				candidates.push_back(max_idx);
-			} else {
-				candidates.push_back(max_idx);
-				candidates.push_back(min_idx);
-			}
-		}
-		bin_start = bin_end;
-	}
-
-	candidates.push_back(n - 1); // always keep last
-	return candidates;
-}
 
 // Bind data for minmax_lttb: carries sorted flag, default minmax_ratio, and
 // the bind-time-resolved read/write function pointers.
@@ -967,31 +863,119 @@ static void MinMaxLTTBFinalize(Vector &state_vector, AggregateInputData &input_d
 			const auto n_out = static_cast<uint64_t>(state.buckets & 0xFFFFFFFFULL);
 			const auto minmax_ratio = static_cast<int64_t>(state.buckets >> 32);
 			auto &points = *state.points;
-			// Sort if not pre-sorted.
-			if (!skip_sort) {
-				std::stable_sort(points.begin(), points.end(),
-				                 [](const LTTBPoint &lhs, const LTTBPoint &rhs) { return lhs.x < rhs.x; });
-			}
 			const auto n = points.size();
-			// Degenerate cases: n_out=0 → empty; n_out>=n → all; ratio<=1 or
-			// n/ratio<=n_out → standard LTTB (no preselect).
+			// Degenerate cases bypass bin-first:
+			//   n_out=0 → empty; n<=n_out → all points (via Downsample);
+			//   ratio<=1 or n/ratio<=n_out → preselect won't help, run
+			//   standard LTTB directly (Downsample handles sort via skip_sort).
 			if (n_out == 0) {
 				sampled = {};
 			} else if (n <= n_out) {
-				sampled = std::move(points);
+				sampled = Downsample(points, n_out, skip_sort);
 			} else if (minmax_ratio <= 1 || n / static_cast<uint64_t>(minmax_ratio) <= n_out) {
-				sampled = Downsample(points, n_out, true); // already sorted
+				sampled = Downsample(points, n_out, skip_sort);
 			} else {
-				// Stage 1: MinMax preselect.
-				const auto n_minmax_buckets = (n_out * static_cast<uint64_t>(minmax_ratio)) / 2;
-				auto candidate_indices = MinMaxPreselect(points, n_minmax_buckets);
-				// Stage 2: LTTB on the candidate set.
-				std::vector<LTTBPoint> candidates;
-				candidates.reserve(candidate_indices.size());
-				for (auto idx : candidate_indices) {
-					candidates.push_back(points[idx]);
+				// Bin-first MinMax preselect: O(n) binning + O(k log k) candidate
+				// sort. See docs/architecture.md §4.7 for rationale & benchmarks.
+				double x_min = std::numeric_limits<double>::max();
+				double x_max = std::numeric_limits<double>::lowest();
+				idx_t first_idx = 0;
+				idx_t last_idx = 0;
+				for (idx_t i = 0; i < n; i++) {
+					if (points[i].x < x_min) {
+						x_min = points[i].x;
+						first_idx = i;
+					}
+					if (points[i].x > x_max) {
+						x_max = points[i].x;
+						last_idx = i;
+					}
 				}
-				sampled = Downsample(candidates, n_out, true); // candidates already sorted by x
+
+				// Step 2: bin interior points (excluding first/last) into equi-width
+				// x-range bins, keeping argmin(y)/argmax(y) per bin.
+				const auto n_minmax_buckets = (n_out * static_cast<uint64_t>(minmax_ratio)) / 2;
+				struct PerBin {
+					LTTBPoint min_point;
+					LTTBPoint max_point;
+					idx_t min_idx;
+					idx_t max_idx;
+					uint64_t count;
+					bool has_data;
+				};
+				std::vector<PerBin> bins(n_minmax_buckets);
+				const double x_range = x_max - x_min;
+				const double inv_bin_width =
+				    (x_range > 0.0) ? static_cast<double>(n_minmax_buckets) / x_range : 0.0;
+
+				for (idx_t i = 0; i < n; i++) {
+					if (i == first_idx || i == last_idx) {
+						continue;
+					}
+					uint64_t bin_idx;
+					if (x_range <= 0.0) {
+						bin_idx = 0;
+					} else {
+						bin_idx = static_cast<uint64_t>((points[i].x - x_min) * inv_bin_width);
+						if (bin_idx >= n_minmax_buckets) {
+							bin_idx = n_minmax_buckets - 1;
+						}
+					}
+					auto &bin = bins[bin_idx];
+					if (!bin.has_data) {
+						bin.min_point = points[i];
+						bin.max_point = points[i];
+						bin.min_idx = i;
+						bin.max_idx = i;
+						bin.count = 1;
+						bin.has_data = true;
+					} else {
+						bin.count++;
+						if (points[i].y < bin.min_point.y) {
+							bin.min_point = points[i];
+							bin.min_idx = i;
+						}
+						if (points[i].y > bin.max_point.y) {
+							bin.max_point = points[i];
+							bin.max_idx = i;
+						}
+					}
+				}
+
+				// Step 3: candidate set = first + per-bin argmin/argmax + last.
+				// Push min/max in x-order so the subsequent sort is stable.
+				std::vector<LTTBPoint> candidates;
+				candidates.reserve(2 + 2 * n_minmax_buckets);
+				candidates.push_back(points[first_idx]);
+				for (auto &bin : bins) {
+					if (!bin.has_data) {
+						continue;
+					}
+					if (bin.count <= 2) {
+						candidates.push_back(bin.min_point);
+						if (bin.max_idx != bin.min_idx) {
+							candidates.push_back(bin.max_point);
+						}
+					} else {
+						if (bin.min_point.x <= bin.max_point.x) {
+							candidates.push_back(bin.min_point);
+							candidates.push_back(bin.max_point);
+						} else {
+							candidates.push_back(bin.max_point);
+							candidates.push_back(bin.min_point);
+						}
+					}
+				}
+				// Guard against all-x-equal: first_idx == last_idx would duplicate
+				// the endpoint. Only push last when it is a distinct point.
+				if (last_idx != first_idx) {
+					candidates.push_back(points[last_idx]);
+				}
+
+				// Step 4: sort candidates by x, then run LTTB (skip_sort=true).
+				std::stable_sort(candidates.begin(), candidates.end(),
+				                 [](const LTTBPoint &lhs, const LTTBPoint &rhs) { return lhs.x < rhs.x; });
+				sampled = Downsample(candidates, n_out, true);
 			}
 		}
 		ListVector::Reserve(result, total_size + sampled.size());
@@ -1045,17 +1029,40 @@ static AggregateFunction GetMinMaxLTTBFunction(const string &name) {
 	                         MinMaxLTTBBindFunction, nullptr);
 }
 
+static unique_ptr<FunctionData> MinMaxLTTBSortedBindFunction(ClientContext &, AggregateFunction &function,
+                                                              vector<unique_ptr<Expression>> &arguments) {
+	for (auto &argument : arguments) {
+		if (argument->return_type.id() == LogicalTypeId::UNKNOWN) {
+			throw ParameterNotResolvedException();
+		}
+	}
+
+	const auto &x_type = arguments[0]->return_type;
+	const auto &y_type = arguments[1]->return_type;
+	const auto &x_resolved = x_type.id() == LogicalTypeId::SQLNULL ? LogicalType::DOUBLE : x_type;
+	const auto &y_resolved = y_type.id() == LogicalTypeId::SQLNULL ? LogicalType::DOUBLE : y_type;
+	if (!IsLTTBSupportedType(x_resolved) || !IsLTTBSupportedType(y_resolved)) {
+		throw InvalidInputException(
+		    "minmax_lttb_sorted requires numeric or temporal x/y types; got x=%s, y=%s", x_type.ToString(), y_type.ToString());
+	}
+
+	function = GetMinMaxLTTBConcreteFunction(function.name, x_resolved, y_resolved);
+	// Default minmax_ratio = 4 (matches plotly-resampler MinMaxLTTB default).
+	return make_uniq<MinMaxLTTBFunctionData>(true, 4, MakeReader(x_resolved), MakeReader(y_resolved),
+	                                          MakeWriter(x_resolved), MakeWriter(y_resolved));
+}
+
+static AggregateFunction GetMinMaxLTTBSortedFunction(const string &name) {
+	return AggregateFunction(name, {LogicalType::ANY, LogicalType::ANY, LogicalType::BIGINT, LogicalType::BIGINT},
+	                         LogicalType::ANY, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+	                         MinMaxLTTBSortedBindFunction, nullptr);
+}
+
 // ---------------------------------------------------------------------------
-// bucket_stats: per-bucket statistical downsampling for AI agent analysis.
-//
 // bucket_stats(x, y, num_buckets) → STRUCT(bucket_start, bucket_end, count,
-// min, max, mean, std, first, last)[]
-//
-// Stats are over y only; x provides bucket range boundaries (bucket_start,
-// bucket_end). Equal-count-by-index bucketing (same formula as LTTB). First
-// and last points of the whole series are in the boundary buckets. Population
-// std (divide by N, not N-1). min/max/first/last preserve y_type; mean/std
-// are DOUBLE.
+// min, max, mean, std, first, last)[]. Equal-count-by-index bucketing (same
+// formula as LTTB). Stats over y only; population std (÷N). See
+// docs/architecture.md §4.8 for details.
 // ---------------------------------------------------------------------------
 
 struct BucketStatsFunctionData : public FunctionData {
@@ -1349,6 +1356,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(GetLTTBIndicesFunction("lttb_indices"));
 	// MinMax preselection + LTTB for large inputs (compute win, no memory win).
 	loader.RegisterFunction(GetMinMaxLTTBFunction("minmax_lttb"));
+	// Sorted-input fast path for minmax_lttb.
+	loader.RegisterFunction(GetMinMaxLTTBSortedFunction("minmax_lttb_sorted"));
 	// Per-bucket statistical downsampling for AI agent distribution analysis.
 	loader.RegisterFunction(GetBucketStatsFunction("bucket_stats"));
 }
