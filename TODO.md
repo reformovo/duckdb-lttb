@@ -308,7 +308,7 @@ operate on doubles internally; type conversion happens at I/O boundaries.
   - **Fix**: push a single point when `min_idx == max_idx`.
   - **Severity**: Low.
 
-- [ ] Extract `MinMaxLTTBBindFunctionImpl` to dedupe bind functions
+- [x] Extract `MinMaxLTTBBindFunctionImpl` to dedupe bind functions
   - **Issue**: `MinMaxLTTBBindFunction` and `MinMaxLTTBSortedBindFunction` are
     near-identical, differing only in the `sorted` flag and the function name in
     the error message. The `lttb` family already factors this into

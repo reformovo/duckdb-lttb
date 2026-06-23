@@ -1028,8 +1028,12 @@ static AggregateFunction GetMinMaxLTTBConcreteFunction(const string &name, const
 	                         LTTBDestroy);
 }
 
-static unique_ptr<FunctionData> MinMaxLTTBBindFunction(ClientContext &, AggregateFunction &function,
-                                                       vector<unique_ptr<Expression>> &arguments) {
+// Shared bind logic for minmax_lttb and minmax_lttb_sorted. `sorted` carries
+// the caller's pre-sorted-input guarantee; `func_name` is used in the type
+// error so each variant reports its own name. Mirrors LTTBBindFunctionImpl.
+static unique_ptr<FunctionData> MinMaxLTTBBindFunctionImpl(ClientContext &, AggregateFunction &function,
+                                                           vector<unique_ptr<Expression>> &arguments, bool sorted,
+                                                           const char *func_name) {
 	for (auto &argument : arguments) {
 		if (argument->return_type.id() == LogicalTypeId::UNKNOWN) {
 			throw ParameterNotResolvedException();
@@ -1038,17 +1042,23 @@ static unique_ptr<FunctionData> MinMaxLTTBBindFunction(ClientContext &, Aggregat
 
 	const auto &x_type = arguments[0]->return_type;
 	const auto &y_type = arguments[1]->return_type;
+	// SQLNULL (untyped NULL literal) coerces to DOUBLE for backward compatibility.
 	const auto &x_resolved = x_type.id() == LogicalTypeId::SQLNULL ? LogicalType::DOUBLE : x_type;
 	const auto &y_resolved = y_type.id() == LogicalTypeId::SQLNULL ? LogicalType::DOUBLE : y_type;
 	if (!IsLTTBSupportedType(x_resolved) || !IsLTTBSupportedType(y_resolved)) {
 		throw InvalidInputException(
-		    "minmax_lttb requires numeric or temporal x/y types; got x=%s, y=%s", x_type.ToString(), y_type.ToString());
+		    "%s requires numeric or temporal x/y types; got x=%s, y=%s", func_name, x_type.ToString(), y_type.ToString());
 	}
 
 	function = GetMinMaxLTTBConcreteFunction(function.name, x_resolved, y_resolved);
 	// Default minmax_ratio = 4 (matches plotly-resampler MinMaxLTTB default).
-	return make_uniq<MinMaxLTTBFunctionData>(false, 4, MakeReader(x_resolved), MakeReader(y_resolved),
+	return make_uniq<MinMaxLTTBFunctionData>(sorted, 4, MakeReader(x_resolved), MakeReader(y_resolved),
 	                                          MakeWriter(x_resolved), MakeWriter(y_resolved));
+}
+
+static unique_ptr<FunctionData> MinMaxLTTBBindFunction(ClientContext &context, AggregateFunction &function,
+                                                       vector<unique_ptr<Expression>> &arguments) {
+	return MinMaxLTTBBindFunctionImpl(context, function, arguments, false, "minmax_lttb");
 }
 
 static AggregateFunction GetMinMaxLTTBFunction(const string &name) {
@@ -1057,27 +1067,9 @@ static AggregateFunction GetMinMaxLTTBFunction(const string &name) {
 	                         MinMaxLTTBBindFunction, nullptr);
 }
 
-static unique_ptr<FunctionData> MinMaxLTTBSortedBindFunction(ClientContext &, AggregateFunction &function,
+static unique_ptr<FunctionData> MinMaxLTTBSortedBindFunction(ClientContext &context, AggregateFunction &function,
                                                               vector<unique_ptr<Expression>> &arguments) {
-	for (auto &argument : arguments) {
-		if (argument->return_type.id() == LogicalTypeId::UNKNOWN) {
-			throw ParameterNotResolvedException();
-		}
-	}
-
-	const auto &x_type = arguments[0]->return_type;
-	const auto &y_type = arguments[1]->return_type;
-	const auto &x_resolved = x_type.id() == LogicalTypeId::SQLNULL ? LogicalType::DOUBLE : x_type;
-	const auto &y_resolved = y_type.id() == LogicalTypeId::SQLNULL ? LogicalType::DOUBLE : y_type;
-	if (!IsLTTBSupportedType(x_resolved) || !IsLTTBSupportedType(y_resolved)) {
-		throw InvalidInputException(
-		    "minmax_lttb_sorted requires numeric or temporal x/y types; got x=%s, y=%s", x_type.ToString(), y_type.ToString());
-	}
-
-	function = GetMinMaxLTTBConcreteFunction(function.name, x_resolved, y_resolved);
-	// Default minmax_ratio = 4 (matches plotly-resampler MinMaxLTTB default).
-	return make_uniq<MinMaxLTTBFunctionData>(true, 4, MakeReader(x_resolved), MakeReader(y_resolved),
-	                                          MakeWriter(x_resolved), MakeWriter(y_resolved));
+	return MinMaxLTTBBindFunctionImpl(context, function, arguments, true, "minmax_lttb_sorted");
 }
 
 static AggregateFunction GetMinMaxLTTBSortedFunction(const string &name) {
