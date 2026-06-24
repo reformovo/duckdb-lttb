@@ -80,10 +80,15 @@ static bool IsValidPoint(double x, double y) {
 }
 
 // Strict-weak ordering by x. Shared by Downsample, MinMax preselect, and
-// bucket_stats so the comparator cannot drift between call sites.
-static bool LessByX(const LTTBPoint &lhs, const LTTBPoint &rhs) {
-	return lhs.x < rhs.x;
-}
+// bucket_stats so the comparator cannot drift between call sites. A functor
+// (not a free function) is passed by value to std::stable_sort so the compiler
+// can inline the comparison into the sort's inner loop; a free function would
+// decay to a function pointer and force an indirect call per comparison.
+struct LessByX {
+	bool operator()(const LTTBPoint &lhs, const LTTBPoint &rhs) const {
+		return lhs.x < rhs.x;
+	}
+};
 
 // Append a valid (x, y) point to the per-group state vector, allocating the
 // vector on first use and enforcing the global point-count cap. Shared by the
@@ -440,7 +445,7 @@ static std::vector<LTTBPoint> Downsample(std::vector<LTTBPoint> &points, uint64_
 		// Stable sort: preserve insertion order for equal x values.
 		// Epoch-double conversion is monotonic for all supported types, so sorting
 		// on doubles preserves correct temporal ordering.
-		std::stable_sort(points.begin(), points.end(), LessByX);
+		std::stable_sort(points.begin(), points.end(), LessByX {});
 	}
 
 	const auto n = points.size();
@@ -1057,7 +1062,7 @@ static std::vector<LTTBPoint> MinMaxLTTBDownsample(std::vector<LTTBPoint> &point
 	auto bins = BuildMinMaxBins(points, n_minmax_buckets, range.first_idx, range.last_idx, range.x_min, range.x_max);
 	auto candidates = CollectMinMaxCandidates(points, bins, range.first_idx, range.last_idx);
 	// Step 4: sort candidates by x, then run LTTB (skip_sort=true).
-	std::stable_sort(candidates.begin(), candidates.end(), LessByX);
+	std::stable_sort(candidates.begin(), candidates.end(), LessByX {});
 	return Downsample(candidates, n_out, true);
 }
 
@@ -1374,7 +1379,7 @@ static void BucketStatsFinalize(Vector &state_vector, AggregateInputData &input_
 		if (state.has_buckets && state.points) {
 			auto &points = *state.points;
 			// Stable sort by x (bucket_stats does not have a sorted variant).
-			std::stable_sort(points.begin(), points.end(), LessByX);
+			std::stable_sort(points.begin(), points.end(), LessByX {});
 			const auto n = points.size();
 			const auto num_buckets = state.buckets;
 
