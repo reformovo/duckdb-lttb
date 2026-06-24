@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "reform": {
+      "source": "reformovo/skills",
+      "sourceType": "github",
+      "skillPath": "skills/reform/SKILL.md",
+      "computedHash": "758d1c77be086cf4b89ada26a822096b1c455bf2b7f3ad93be2bc905430bdfec"
+    }
+  }
+}

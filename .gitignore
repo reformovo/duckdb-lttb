@@ -8,3 +8,5 @@ test/python/__pycache__/
 .Rhistory
 .cache
 .slim/deepwork/
+.ignore
+.agents
