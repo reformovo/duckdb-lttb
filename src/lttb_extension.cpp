@@ -25,11 +25,9 @@ constexpr idx_t MAX_LTTB_POINTS = 1ULL << 30;
 
 // Powers of 10 indexed by DECIMAL scale (max DuckDB DECIMAL scale is 38).
 // Used to convert between raw int storage and double for DECIMAL I/O.
-static constexpr double POW10[] = {
-    1e0,  1e1,  1e2,  1e3,  1e4,  1e5,  1e6,  1e7,  1e8,  1e9,
-    1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19,
-    1e20, 1e21, 1e22, 1e23, 1e24, 1e25, 1e26, 1e27, 1e28, 1e29,
-    1e30, 1e31, 1e32, 1e33, 1e34, 1e35, 1e36, 1e37, 1e38};
+static constexpr double POW10[] = {1e0,  1e1,  1e2,  1e3,  1e4,  1e5,  1e6,  1e7,  1e8,  1e9,  1e10, 1e11, 1e12,
+                                   1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22, 1e23, 1e24, 1e25,
+                                   1e26, 1e27, 1e28, 1e29, 1e30, 1e31, 1e32, 1e33, 1e34, 1e35, 1e36, 1e37, 1e38};
 
 struct LTTBPoint {
 	double x;
@@ -67,8 +65,8 @@ struct LTTBFunctionData : public FunctionData {
 
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<LTTBFunctionData>();
-		return sorted == other.sorted && x_read == other.x_read && y_read == other.y_read &&
-		       x_write == other.x_write && y_write == other.y_write;
+		return sorted == other.sorted && x_read == other.x_read && y_read == other.y_read && x_write == other.x_write &&
+		       y_write == other.y_write;
 	}
 };
 
@@ -142,14 +140,13 @@ static ReadFunc MakeReader(const LogicalType &type) {
 		};
 	case LogicalTypeId::DATE:
 		return [](const UnifiedVectorFormat &d, idx_t r, const LogicalType &) {
-			return static_cast<double>(
-			    Date::EpochDays(UnifiedVectorFormat::GetData<date_t>(d)[d.sel->get_index(r)]));
+			return static_cast<double>(Date::EpochDays(UnifiedVectorFormat::GetData<date_t>(d)[d.sel->get_index(r)]));
 		};
 	case LogicalTypeId::TIMESTAMP:
 	case LogicalTypeId::TIMESTAMP_TZ:
 		return [](const UnifiedVectorFormat &d, idx_t r, const LogicalType &) {
-			return static_cast<double>(Timestamp::GetEpochMicroSeconds(
-			    UnifiedVectorFormat::GetData<timestamp_t>(d)[d.sel->get_index(r)]));
+			return static_cast<double>(
+			    Timestamp::GetEpochMicroSeconds(UnifiedVectorFormat::GetData<timestamp_t>(d)[d.sel->get_index(r)]));
 		};
 	case LogicalTypeId::TIMESTAMP_SEC:
 		return [](const UnifiedVectorFormat &d, idx_t r, const LogicalType &) {
@@ -337,7 +334,7 @@ static bool IsLTTBSupportedType(const LogicalType &type) {
 // consumer). If `out_indices` is non-null, fills it with selected sorted-position
 // indices (for lttb_indices).
 static std::vector<LTTBPoint> Downsample(std::vector<LTTBPoint> &points, uint64_t buckets, bool skip_sort = false,
-                                        std::vector<idx_t> *out_indices = nullptr) {
+                                         std::vector<idx_t> *out_indices = nullptr) {
 	// No buckets requested — return empty immediately, no sorting needed.
 	if (buckets == 0) {
 		return {};
@@ -396,11 +393,9 @@ static std::vector<LTTBPoint> Downsample(std::vector<LTTBPoint> &points, uint64_
 		const auto next_bucket = static_cast<double>(bucket + 1);
 		const auto after_next_bucket = static_cast<double>(bucket + 2);
 		const auto current_start = static_cast<idx_t>(std::floor(current_bucket * bucket_width)) + 1;
-		const auto current_end = MinValue<idx_t>(static_cast<idx_t>(std::floor(next_bucket * bucket_width)) + 1,
-		                                         n - 1);
+		const auto current_end = MinValue<idx_t>(static_cast<idx_t>(std::floor(next_bucket * bucket_width)) + 1, n - 1);
 		const auto next_start = static_cast<idx_t>(std::floor(next_bucket * bucket_width)) + 1;
-		const auto next_end =
-		    MinValue<idx_t>(static_cast<idx_t>(std::floor(after_next_bucket * bucket_width)) + 1, n);
+		const auto next_end = MinValue<idx_t>(static_cast<idx_t>(std::floor(after_next_bucket * bucket_width)) + 1, n);
 
 		double avg_x = 0;
 		double avg_y = 0;
@@ -592,7 +587,8 @@ static void LTTBFinalize(Vector &state_vector, AggregateInputData &input_data, V
 	idx_t total_size = ListVector::GetListSize(result);
 	for (idx_t row = 0; row < count; row++) {
 		auto &state = *states[state_data.sel->get_index(row)];
-		auto sampled = state.has_buckets && state.points ? Downsample(*state.points, state.buckets, skip_sort) : std::vector<LTTBPoint>();
+		auto sampled = state.has_buckets && state.points ? Downsample(*state.points, state.buckets, skip_sort)
+		                                                 : std::vector<LTTBPoint>();
 		ListVector::Reserve(result, total_size + sampled.size());
 
 		auto &entry = list_entries[row + offset];
@@ -615,8 +611,7 @@ static void LTTBIndicesFinalize(Vector &state_vector, AggregateInputData &input_
 	auto states = UnifiedVectorFormat::GetData<LTTBState *>(state_data);
 	auto list_entries = FlatVector::GetData<list_entry_t>(result);
 
-	const bool skip_sort =
-	    input_data.bind_data && input_data.bind_data->Cast<LTTBFunctionData>().sorted;
+	const bool skip_sort = input_data.bind_data && input_data.bind_data->Cast<LTTBFunctionData>().sorted;
 
 	idx_t total_size = ListVector::GetListSize(result);
 	for (idx_t row = 0; row < count; row++) {
@@ -663,8 +658,8 @@ static LogicalType LTTBReturnType(const LogicalType &x_type, const LogicalType &
 
 static AggregateFunction GetLTTBConcreteFunction(const string &name, const LogicalType &x_type,
                                                  const LogicalType &y_type) {
-	return AggregateFunction(name, {x_type, y_type, LogicalType::BIGINT}, LTTBReturnType(x_type, y_type),
-	                         LTTBStateSize, LTTBInitialize, LTTBUpdate, LTTBCombine, LTTBFinalize,
+	return AggregateFunction(name, {x_type, y_type, LogicalType::BIGINT}, LTTBReturnType(x_type, y_type), LTTBStateSize,
+	                         LTTBInitialize, LTTBUpdate, LTTBCombine, LTTBFinalize,
 	                         FunctionNullHandling::SPECIAL_HANDLING, nullptr, nullptr, LTTBDestroy);
 }
 
@@ -678,8 +673,8 @@ static AggregateFunction GetLTTBIndicesConcreteFunction(const string &name, cons
 }
 
 static unique_ptr<FunctionData> LTTBBindFunctionImpl(ClientContext &, AggregateFunction &function,
-                                                    vector<unique_ptr<Expression>> &arguments, bool sorted,
-                                                    bool indices) {
+                                                     vector<unique_ptr<Expression>> &arguments, bool sorted,
+                                                     bool indices) {
 	for (auto &argument : arguments) {
 		if (argument->return_type.id() == LogicalTypeId::UNKNOWN) {
 			throw ParameterNotResolvedException();
@@ -692,8 +687,8 @@ static unique_ptr<FunctionData> LTTBBindFunctionImpl(ClientContext &, AggregateF
 	const auto &x_resolved = x_type.id() == LogicalTypeId::SQLNULL ? LogicalType::DOUBLE : x_type;
 	const auto &y_resolved = y_type.id() == LogicalTypeId::SQLNULL ? LogicalType::DOUBLE : y_type;
 	if (!IsLTTBSupportedType(x_resolved) || !IsLTTBSupportedType(y_resolved)) {
-		throw InvalidInputException(
-		    "lttb requires numeric or temporal x/y types; got x=%s, y=%s", x_type.ToString(), y_type.ToString());
+		throw InvalidInputException("lttb requires numeric or temporal x/y types; got x=%s, y=%s", x_type.ToString(),
+		                            y_type.ToString());
 	}
 
 	if (indices) {
@@ -703,8 +698,8 @@ static unique_ptr<FunctionData> LTTBBindFunctionImpl(ClientContext &, AggregateF
 	}
 	// Resolve the type-specific read/write function pointers at bind time so
 	// the per-row Update/Finalize loops avoid a 20-case switch dispatch.
-	return make_uniq<LTTBFunctionData>(sorted, MakeReader(x_resolved), MakeReader(y_resolved),
-	                                   MakeWriter(x_resolved), MakeWriter(y_resolved));
+	return make_uniq<LTTBFunctionData>(sorted, MakeReader(x_resolved), MakeReader(y_resolved), MakeWriter(x_resolved),
+	                                   MakeWriter(y_resolved));
 }
 
 static unique_ptr<FunctionData> LTTBBindFunction(ClientContext &context, AggregateFunction &function,
@@ -748,7 +743,7 @@ static AggregateFunction GetLTTBIndicesFunction(const string &name) {
 // the bind-time-resolved read/write function pointers.
 struct MinMaxLTTBFunctionData : public FunctionData {
 	MinMaxLTTBFunctionData(bool sorted_p, int64_t minmax_ratio_p, ReadFunc x_read_p, ReadFunc y_read_p,
-	                        WriteFunc x_write_p, WriteFunc y_write_p)
+	                       WriteFunc x_write_p, WriteFunc y_write_p)
 	    : sorted(sorted_p), minmax_ratio(minmax_ratio_p), x_read(x_read_p), y_read(y_read_p), x_write(x_write_p),
 	      y_write(y_write_p) {
 	}
@@ -778,8 +773,8 @@ struct MinMaxLTTBFunctionData : public FunctionData {
 // per-group minmax_ratio into state.buckets (low 32 bits = n_out, high 32 =
 // ratio) so Finalize can recover both without extra state. Rejects ratio<=1
 // and non-constant ratio within a group.
-static void MinMaxLTTBUpdate(Vector inputs[], AggregateInputData &input_data, idx_t input_count,
-                             Vector &state_vector, idx_t count) {
+static void MinMaxLTTBUpdate(Vector inputs[], AggregateInputData &input_data, idx_t input_count, Vector &state_vector,
+                             idx_t count) {
 	D_ASSERT(input_count == 4);
 
 	UnifiedVectorFormat state_data;
@@ -939,8 +934,7 @@ static void MinMaxLTTBFinalize(Vector &state_vector, AggregateInputData &input_d
 				};
 				std::vector<PerBin> bins(n_minmax_buckets);
 				const double x_range = x_max - x_min;
-				const double inv_bin_width =
-				    (x_range > 0.0) ? static_cast<double>(n_minmax_buckets) / x_range : 0.0;
+				const double inv_bin_width = (x_range > 0.0) ? static_cast<double>(n_minmax_buckets) / x_range : 0.0;
 
 				for (idx_t i = 0; i < n; i++) {
 					if (i == first_idx || i == last_idx) {
@@ -955,31 +949,31 @@ static void MinMaxLTTBFinalize(Vector &state_vector, AggregateInputData &input_d
 							bin_idx = n_minmax_buckets - 1;
 						}
 					}
-auto &bin = bins[bin_idx];
-				if (!bin.has_data) {
-					bin.first_point = points[i];
-					bin.first_idx = i;
-					bin.min_point = points[i];
-					bin.max_point = points[i];
-					bin.min_idx = i;
-					bin.max_idx = i;
-					bin.count = 1;
-					bin.has_data = true;
-				} else {
-					bin.count++;
-					if (bin.count == 2) {
-						bin.second_point = points[i];
-						bin.second_idx = i;
-					}
-					if (points[i].y < bin.min_point.y) {
+					auto &bin = bins[bin_idx];
+					if (!bin.has_data) {
+						bin.first_point = points[i];
+						bin.first_idx = i;
 						bin.min_point = points[i];
-						bin.min_idx = i;
-					}
-					if (points[i].y > bin.max_point.y) {
 						bin.max_point = points[i];
+						bin.min_idx = i;
 						bin.max_idx = i;
+						bin.count = 1;
+						bin.has_data = true;
+					} else {
+						bin.count++;
+						if (bin.count == 2) {
+							bin.second_point = points[i];
+							bin.second_idx = i;
+						}
+						if (points[i].y < bin.min_point.y) {
+							bin.min_point = points[i];
+							bin.min_idx = i;
+						}
+						if (points[i].y > bin.max_point.y) {
+							bin.max_point = points[i];
+							bin.max_idx = i;
+						}
 					}
-				}
 				}
 
 				// Step 3: candidate set = first + per-bin argmin/argmax + last.
@@ -991,35 +985,35 @@ auto &bin = bins[bin_idx];
 					if (!bin.has_data) {
 						continue;
 					}
-if (bin.count == 1) {
-					candidates.push_back(bin.first_point);
-				} else if (bin.count == 2) {
-					// Keep both points; argmin/argmax collapse equal-y pairs to one
-					// index, so the second point must come from explicit tracking.
-					if (bin.first_point.x <= bin.second_point.x) {
+					if (bin.count == 1) {
 						candidates.push_back(bin.first_point);
-						candidates.push_back(bin.second_point);
+					} else if (bin.count == 2) {
+						// Keep both points; argmin/argmax collapse equal-y pairs to one
+						// index, so the second point must come from explicit tracking.
+						if (bin.first_point.x <= bin.second_point.x) {
+							candidates.push_back(bin.first_point);
+							candidates.push_back(bin.second_point);
+						} else {
+							candidates.push_back(bin.second_point);
+							candidates.push_back(bin.first_point);
+						}
 					} else {
-						candidates.push_back(bin.second_point);
-						candidates.push_back(bin.first_point);
-					}
-} else {
-					// count > 2: keep argmin(y) and argmax(y). When every point in
-					// the bin shares the same y, min_idx == max_idx (both the first
-					// point), so push a single representative to avoid a duplicate
-					// candidate (harmless to LTTB but wastes a slot and skews the
-					// next-bucket average).
-					if (bin.min_idx == bin.max_idx) {
-						candidates.push_back(bin.min_point);
-					} else if (bin.min_point.x <= bin.max_point.x) {
-						candidates.push_back(bin.min_point);
-						candidates.push_back(bin.max_point);
-					} else {
-						candidates.push_back(bin.max_point);
-						candidates.push_back(bin.min_point);
+						// count > 2: keep argmin(y) and argmax(y). When every point in
+						// the bin shares the same y, min_idx == max_idx (both the first
+						// point), so push a single representative to avoid a duplicate
+						// candidate (harmless to LTTB but wastes a slot and skews the
+						// next-bucket average).
+						if (bin.min_idx == bin.max_idx) {
+							candidates.push_back(bin.min_point);
+						} else if (bin.min_point.x <= bin.max_point.x) {
+							candidates.push_back(bin.min_point);
+							candidates.push_back(bin.max_point);
+						} else {
+							candidates.push_back(bin.max_point);
+							candidates.push_back(bin.min_point);
+						}
 					}
 				}
-			}
 				// Guard against all-x-equal: first_idx == last_idx would duplicate
 				// the endpoint. Only push last when it is a distinct point.
 				if (last_idx != first_idx) {
@@ -1072,14 +1066,14 @@ static unique_ptr<FunctionData> MinMaxLTTBBindFunctionImpl(ClientContext &, Aggr
 	const auto &x_resolved = x_type.id() == LogicalTypeId::SQLNULL ? LogicalType::DOUBLE : x_type;
 	const auto &y_resolved = y_type.id() == LogicalTypeId::SQLNULL ? LogicalType::DOUBLE : y_type;
 	if (!IsLTTBSupportedType(x_resolved) || !IsLTTBSupportedType(y_resolved)) {
-		throw InvalidInputException(
-		    "%s requires numeric or temporal x/y types; got x=%s, y=%s", func_name, x_type.ToString(), y_type.ToString());
+		throw InvalidInputException("%s requires numeric or temporal x/y types; got x=%s, y=%s", func_name,
+		                            x_type.ToString(), y_type.ToString());
 	}
 
 	function = GetMinMaxLTTBConcreteFunction(function.name, x_resolved, y_resolved);
 	// Default minmax_ratio = 4 (matches plotly-resampler MinMaxLTTB default).
 	return make_uniq<MinMaxLTTBFunctionData>(sorted, 4, MakeReader(x_resolved), MakeReader(y_resolved),
-	                                          MakeWriter(x_resolved), MakeWriter(y_resolved));
+	                                         MakeWriter(x_resolved), MakeWriter(y_resolved));
 }
 
 static unique_ptr<FunctionData> MinMaxLTTBBindFunction(ClientContext &context, AggregateFunction &function,
@@ -1094,7 +1088,7 @@ static AggregateFunction GetMinMaxLTTBFunction(const string &name) {
 }
 
 static unique_ptr<FunctionData> MinMaxLTTBSortedBindFunction(ClientContext &context, AggregateFunction &function,
-                                                              vector<unique_ptr<Expression>> &arguments) {
+                                                             vector<unique_ptr<Expression>> &arguments) {
 	return MinMaxLTTBBindFunctionImpl(context, function, arguments, true, "minmax_lttb_sorted");
 }
 
@@ -1127,16 +1121,15 @@ struct BucketStatsFunctionData : public FunctionData {
 
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<BucketStatsFunctionData>();
-		return x_read == other.x_read && y_read == other.y_read && x_write == other.x_write &&
-		       y_write == other.y_write;
+		return x_read == other.x_read && y_read == other.y_read && x_write == other.x_write && y_write == other.y_write;
 	}
 };
 
 // Accumulate valid points into the shared LTTBState. Reuses the same state as
 // lttb/minmax_lttb so the aggregate framework can combine them uniformly;
 // bucketing and stats computation happen in Finalize.
-static void BucketStatsUpdate(Vector inputs[], AggregateInputData &input_data, idx_t input_count,
-                              Vector &state_vector, idx_t count) {
+static void BucketStatsUpdate(Vector inputs[], AggregateInputData &input_data, idx_t input_count, Vector &state_vector,
+                              idx_t count) {
 	D_ASSERT(input_count == 3);
 
 	UnifiedVectorFormat state_data;
@@ -1388,13 +1381,13 @@ static unique_ptr<FunctionData> BucketStatsBindFunction(ClientContext &, Aggrega
 	const auto &x_resolved = x_type.id() == LogicalTypeId::SQLNULL ? LogicalType::DOUBLE : x_type;
 	const auto &y_resolved = y_type.id() == LogicalTypeId::SQLNULL ? LogicalType::DOUBLE : y_type;
 	if (!IsLTTBSupportedType(x_resolved) || !IsLTTBSupportedType(y_resolved)) {
-		throw InvalidInputException(
-		    "bucket_stats requires numeric or temporal x/y types; got x=%s, y=%s", x_type.ToString(), y_type.ToString());
+		throw InvalidInputException("bucket_stats requires numeric or temporal x/y types; got x=%s, y=%s",
+		                            x_type.ToString(), y_type.ToString());
 	}
 
 	function = GetBucketStatsConcreteFunction(function.name, x_resolved, y_resolved);
-	return make_uniq<BucketStatsFunctionData>(MakeReader(x_resolved), MakeReader(y_resolved),
-	                                           MakeWriter(x_resolved), MakeWriter(y_resolved));
+	return make_uniq<BucketStatsFunctionData>(MakeReader(x_resolved), MakeReader(y_resolved), MakeWriter(x_resolved),
+	                                          MakeWriter(y_resolved));
 }
 
 static AggregateFunction GetBucketStatsFunction(const string &name) {

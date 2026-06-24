@@ -1,0 +1,28 @@
+{
+  "permission": {
+    "bash": {
+      "*": "ask",
+      "make *": "allow",
+      "PATH=* make*": "allow",
+      "PATH=* GEN=* make*": "allow",
+      "GEN=* PATH=* make*": "allow",
+      "./build/release/test/unittest*": "allow",
+      "./build/debug/test/unittest*": "allow",
+      "git status*": "allow",
+      "git diff*": "allow",
+      "git log*": "allow",
+      "git add*": "allow",
+      "git config core.hooksPath*": "allow",
+      "chmod +x .githooks/*": "allow",
+      "rm -rf /*": "deny",
+      "git push --force*": "deny",
+      "git push origin main*": "deny",
+      "git push origin master*": "deny"
+    },
+    "read": {
+      "*": "allow",
+      ".env": "deny",
+      ".env.*": "deny"
+    }
+  }
+}

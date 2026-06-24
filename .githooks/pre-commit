@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Pre-commit hook: runs format-check (same check CI runs).
+# Install: git config core.hooksPath .githooks
+set -e
+
+# Git runs hooks with a sanitized PATH that excludes pip-installed binaries
+# (black, clang-format) and Homebrew. Restore them so format-check can find
+# its tools.
+PIP_USER_BIN=$(python3 -c 'import site; print(site.getuserbase() + "/bin")' 2>/dev/null || true)
+[ -n "$PIP_USER_BIN" ] && export PATH="$PIP_USER_BIN:$PATH"
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+echo "[pre-commit] running format-check..."
+make format-check
+
+echo "[pre-commit] format-check passed"
+echo "[pre-commit] reminder: run 'make tidy-check' and"
+echo "  ./build/release/test/unittest \"test/sql/lttb.test\""
+echo "  before pushing."
