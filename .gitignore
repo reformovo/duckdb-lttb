@@ -10,3 +10,4 @@ test/python/__pycache__/
 .slim/deepwork/
 .ignore
 .agents
+opencode.json
