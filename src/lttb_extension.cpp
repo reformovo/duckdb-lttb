@@ -23,6 +23,11 @@ namespace {
 
 constexpr idx_t MAX_LTTB_POINTS = 1ULL << 30;
 
+// Initial vector capacity for the per-group points buffer. Capped modestly to
+// avoid the early geometric reallocations (0->1->2->4->...->256) without
+// over-allocating in many-group scenarios.
+constexpr idx_t kInitialPointReserve = 256;
+
 // Powers of 10 indexed by DECIMAL scale (max DuckDB DECIMAL scale is 38).
 // Used to convert between raw int storage and double for DECIMAL I/O.
 static constexpr double POW10[] = {1e0,  1e1,  1e2,  1e3,  1e4,  1e5,  1e6,  1e7,  1e8,  1e9,  1e10, 1e11, 1e12,
@@ -72,6 +77,40 @@ struct LTTBFunctionData : public FunctionData {
 
 static bool IsValidPoint(double x, double y) {
 	return !std::isnan(x) && !std::isnan(y);
+}
+
+// Strict-weak ordering by x. Shared by Downsample, MinMax preselect, and
+// bucket_stats so the comparator cannot drift between call sites.
+static bool LessByX(const LTTBPoint &lhs, const LTTBPoint &rhs) {
+	return lhs.x < rhs.x;
+}
+
+// Append a valid (x, y) point to the per-group state vector, allocating the
+// vector on first use and enforcing the global point-count cap. Shared by the
+// lttb / minmax_lttb / bucket_stats Update paths.
+static void PushPoint(LTTBState &state, double x, double y, const char *func_name) {
+	if (!state.points) {
+		state.points = new std::vector<LTTBPoint>();
+		state.points->reserve(kInitialPointReserve);
+	}
+	if (state.points->size() >= MAX_LTTB_POINTS) {
+		throw InvalidInputException(std::string(func_name) + " aggregate state exceeded maximum point count of " +
+		                            std::to_string(MAX_LTTB_POINTS));
+	}
+	state.points->push_back({x, y});
+}
+
+// Record the per-group bucket count, enforcing constancy within a group.
+// Shared by the lttb and bucket_stats Update paths (minmax_lttb packs an extra
+// ratio into state.buckets and therefore keeps its own logic).
+static void SetBucketCount(LTTBState &state, uint64_t buckets, const char *func_name) {
+	if (!state.has_buckets) {
+		state.buckets = buckets;
+		state.has_buckets = true;
+	} else if (state.buckets != buckets) {
+		throw InvalidInputException(std::string(func_name) +
+		                            " bucket count must be constant within each aggregate group");
+	}
 }
 
 // Resolve the type-specific read function at bind time. DECIMAL reads scale
@@ -329,6 +368,63 @@ static bool IsLTTBSupportedType(const LogicalType &type) {
 	}
 }
 
+// Average (x, y) of the next bucket's points; falls back to the last point
+// when the bucket is empty (next_end <= next_start).
+static std::pair<double, double> NextBucketAverage(const std::vector<LTTBPoint> &points, idx_t next_start,
+                                                   idx_t next_end) {
+	if (next_end > next_start) {
+		double avg_x = 0;
+		double avg_y = 0;
+		const auto next_count = next_end - next_start;
+		for (idx_t i = next_start; i < next_end; i++) {
+			avg_x += points[i].x;
+			avg_y += points[i].y;
+		}
+		avg_x /= static_cast<double>(next_count);
+		avg_y /= static_cast<double>(next_count);
+		return {avg_x, avg_y};
+	}
+	return {points.back().x, points.back().y};
+}
+
+// Index of the candidate in [current_start, current_end) forming the largest
+// triangle with the previously selected point and the next-bucket average.
+static idx_t SelectMaxAreaPoint(const std::vector<LTTBPoint> &points, const LTTBPoint &previous, idx_t current_start,
+                                idx_t current_end, double avg_x, double avg_y) {
+	double max_area = -1;
+	idx_t max_area_index = current_start;
+	for (idx_t i = current_start; i < current_end; i++) {
+		const auto &candidate = points[i];
+		const auto area = std::abs((previous.x - avg_x) * (candidate.y - previous.y) -
+		                           (previous.x - candidate.x) * (avg_y - previous.y));
+		if (area > max_area) {
+			max_area = area;
+			max_area_index = i;
+		}
+	}
+	return max_area_index;
+}
+
+// Half-open index bounds for the current and next LTTB buckets. The
+// equal-count-by-index bucketing formula: bucket k spans
+// [floor(k*width)+1, floor((k+1)*width)+1), clamped to [1, n-1] / [1, n].
+struct LTTBBucketBounds {
+	idx_t current_start;
+	idx_t current_end;
+	idx_t next_start;
+	idx_t next_end;
+};
+
+static LTTBBucketBounds ComputeLTTBBounds(uint64_t bucket, idx_t n, double bucket_width) {
+	const auto current_bucket = static_cast<double>(bucket);
+	const auto next_bucket = static_cast<double>(bucket + 1);
+	const auto after_next_bucket = static_cast<double>(bucket + 2);
+	return {static_cast<idx_t>(std::floor(current_bucket * bucket_width)) + 1,
+	        MinValue<idx_t>(static_cast<idx_t>(std::floor(next_bucket * bucket_width)) + 1, n - 1),
+	        static_cast<idx_t>(std::floor(next_bucket * bucket_width)) + 1,
+	        MinValue<idx_t>(static_cast<idx_t>(std::floor(after_next_bucket * bucket_width)) + 1, n)};
+}
+
 // Downsample `points` to `buckets` via LTTB. Mutates `points` in place (sorts
 // it; may std::move it when n <= buckets — safe as Finalize is the terminal
 // consumer). If `out_indices` is non-null, fills it with selected sorted-position
@@ -344,8 +440,7 @@ static std::vector<LTTBPoint> Downsample(std::vector<LTTBPoint> &points, uint64_
 		// Stable sort: preserve insertion order for equal x values.
 		// Epoch-double conversion is monotonic for all supported types, so sorting
 		// on doubles preserves correct temporal ordering.
-		std::stable_sort(points.begin(), points.end(),
-		                 [](const LTTBPoint &lhs, const LTTBPoint &rhs) { return lhs.x < rhs.x; });
+		std::stable_sort(points.begin(), points.end(), LessByX);
 	}
 
 	const auto n = points.size();
@@ -389,41 +484,11 @@ static std::vector<LTTBPoint> Downsample(std::vector<LTTBPoint> &points, uint64_
 	idx_t selected_index = 0;
 
 	for (uint64_t bucket = 0; bucket < buckets - 2; bucket++) {
-		const auto current_bucket = static_cast<double>(bucket);
-		const auto next_bucket = static_cast<double>(bucket + 1);
-		const auto after_next_bucket = static_cast<double>(bucket + 2);
-		const auto current_start = static_cast<idx_t>(std::floor(current_bucket * bucket_width)) + 1;
-		const auto current_end = MinValue<idx_t>(static_cast<idx_t>(std::floor(next_bucket * bucket_width)) + 1, n - 1);
-		const auto next_start = static_cast<idx_t>(std::floor(next_bucket * bucket_width)) + 1;
-		const auto next_end = MinValue<idx_t>(static_cast<idx_t>(std::floor(after_next_bucket * bucket_width)) + 1, n);
-
-		double avg_x = 0;
-		double avg_y = 0;
-		if (next_end > next_start) {
-			const auto next_count = next_end - next_start;
-			for (idx_t i = next_start; i < next_end; i++) {
-				avg_x += points[i].x;
-				avg_y += points[i].y;
-			}
-			avg_x /= static_cast<double>(next_count);
-			avg_y /= static_cast<double>(next_count);
-		} else {
-			avg_x = points.back().x;
-			avg_y = points.back().y;
-		}
-
+		const auto bounds = ComputeLTTBBounds(bucket, n, bucket_width);
+		const auto avg = NextBucketAverage(points, bounds.next_start, bounds.next_end);
 		const auto &previous = points[selected_index];
-		double max_area = -1;
-		idx_t max_area_index = current_start;
-		for (idx_t i = current_start; i < current_end; i++) {
-			const auto &candidate = points[i];
-			const auto area = std::abs((previous.x - avg_x) * (candidate.y - previous.y) -
-			                           (previous.x - candidate.x) * (avg_y - previous.y));
-			if (area > max_area) {
-				max_area = area;
-				max_area_index = i;
-			}
-		}
+		const auto max_area_index =
+		    SelectMaxAreaPoint(points, previous, bounds.current_start, bounds.current_end, avg.first, avg.second);
 
 		sampled.push_back(points[max_area_index]);
 		if (out_indices) {
@@ -490,31 +555,14 @@ static void LTTBUpdate(Vector inputs[], AggregateInputData &input_data, idx_t in
 		if (buckets_input < 0) {
 			throw InvalidInputException("lttb bucket count must be non-negative");
 		}
-		const auto buckets = static_cast<uint64_t>(buckets_input);
-		if (!state.has_buckets) {
-			state.buckets = buckets;
-			state.has_buckets = true;
-		} else if (state.buckets != buckets) {
-			throw InvalidInputException("lttb bucket count must be constant within each aggregate group");
-		}
+		SetBucketCount(state, static_cast<uint64_t>(buckets_input), "lttb");
 
 		const auto x = x_read(x_data, row, x_type);
 		const auto y = y_read(y_data, row, y_type);
 		if (!IsValidPoint(x, y)) {
 			continue;
 		}
-		if (!state.points) {
-			state.points = new std::vector<LTTBPoint>();
-			// Reserve a modest initial capacity to avoid the early geometric
-			// reallocations (0→1→2→4→...→256). Capped at 256 to avoid
-			// over-allocation in many-group scenarios.
-			state.points->reserve(256);
-		}
-		if (state.points->size() >= MAX_LTTB_POINTS) {
-			throw InvalidInputException("lttb aggregate state exceeded maximum point count of " +
-			                            std::to_string(MAX_LTTB_POINTS));
-		}
-		state.points->push_back({x, y});
+		PushPoint(state, x, y, "lttb");
 	}
 }
 
@@ -842,22 +890,179 @@ static void MinMaxLTTBUpdate(Vector inputs[], AggregateInputData &input_data, id
 		if (!IsValidPoint(x, y)) {
 			continue;
 		}
-		if (!state.points) {
-			state.points = new std::vector<LTTBPoint>();
-			state.points->reserve(256);
-		}
-		if (state.points->size() >= MAX_LTTB_POINTS) {
-			throw InvalidInputException("minmax_lttb aggregate state exceeded maximum point count of " +
-			                            std::to_string(MAX_LTTB_POINTS));
-		}
-		state.points->push_back({x, y});
+		PushPoint(state, x, y, "minmax_lttb");
 	}
 }
 
-// Two-stage finalize: bin-first MinMax preselect (argmin/argmax of y per
-// equi-width x-range bin) shrinks the full dataset to ~n*ratio candidates,
-// then LTTB runs over the candidates. Degenerate cases (n<=n_out, ratio<=1,
-// n/ratio<=n_out) bypass preselect and run standard LTTB directly.
+// Per-bin accumulator for the MinMax preselect. The first two points seen are
+// kept verbatim so count<=2 bins retain both points even when y is constant
+// (argmin/argmax tracking collapses equal-y points to a single index).
+struct MinMaxBin {
+	LTTBPoint first_point;
+	LTTBPoint second_point;
+	idx_t first_idx;
+	idx_t second_idx;
+	// argmin(y) / argmax(y) over the bin, used when count > 2.
+	LTTBPoint min_point;
+	LTTBPoint max_point;
+	idx_t min_idx;
+	idx_t max_idx;
+	uint64_t count;
+	bool has_data;
+};
+
+// Result of the first pass: the x-range endpoints and their indices. first_idx
+// is the index of the minimum-x point, last_idx the index of the maximum-x
+// point (distinct unless every x is equal).
+struct XRange {
+	double x_min;
+	double x_max;
+	idx_t first_idx;
+	idx_t last_idx;
+};
+
+static XRange FindXRangeEndpoints(const std::vector<LTTBPoint> &points) {
+	double x_min = std::numeric_limits<double>::max();
+	double x_max = std::numeric_limits<double>::lowest();
+	idx_t first_idx = 0;
+	idx_t last_idx = 0;
+	for (idx_t i = 0; i < points.size(); i++) {
+		if (points[i].x < x_min) {
+			x_min = points[i].x;
+			first_idx = i;
+		}
+		if (points[i].x > x_max) {
+			x_max = points[i].x;
+			last_idx = i;
+		}
+	}
+	return {x_min, x_max, first_idx, last_idx};
+}
+
+// Bin interior points (excluding first/last) into equi-width x-range bins,
+// keeping argmin(y)/argmax(y) per bin. Step 2 of the MinMax preselect.
+static std::vector<MinMaxBin> BuildMinMaxBins(const std::vector<LTTBPoint> &points, uint64_t n_minmax_buckets,
+                                              idx_t first_idx, idx_t last_idx, double x_min, double x_max) {
+	std::vector<MinMaxBin> bins(n_minmax_buckets);
+	const double x_range = x_max - x_min;
+	const double inv_bin_width = (x_range > 0.0) ? static_cast<double>(n_minmax_buckets) / x_range : 0.0;
+
+	for (idx_t i = 0; i < points.size(); i++) {
+		if (i == first_idx || i == last_idx) {
+			continue;
+		}
+		uint64_t bin_idx;
+		if (x_range <= 0.0) {
+			bin_idx = 0;
+		} else {
+			bin_idx = static_cast<uint64_t>((points[i].x - x_min) * inv_bin_width);
+			if (bin_idx >= n_minmax_buckets) {
+				bin_idx = n_minmax_buckets - 1;
+			}
+		}
+		auto &bin = bins[bin_idx];
+		if (!bin.has_data) {
+			bin.first_point = points[i];
+			bin.first_idx = i;
+			bin.min_point = points[i];
+			bin.max_point = points[i];
+			bin.min_idx = i;
+			bin.max_idx = i;
+			bin.count = 1;
+			bin.has_data = true;
+		} else {
+			bin.count++;
+			if (bin.count == 2) {
+				bin.second_point = points[i];
+				bin.second_idx = i;
+			}
+			if (points[i].y < bin.min_point.y) {
+				bin.min_point = points[i];
+				bin.min_idx = i;
+			}
+			if (points[i].y > bin.max_point.y) {
+				bin.max_point = points[i];
+				bin.max_idx = i;
+			}
+		}
+	}
+	return bins;
+}
+
+// Candidate set = first + per-bin argmin/argmax + last. Push min/max in x-order
+// so the subsequent sort is stable. Step 3 of the MinMax preselect.
+static std::vector<LTTBPoint> CollectMinMaxCandidates(const std::vector<LTTBPoint> &points,
+                                                      const std::vector<MinMaxBin> &bins, idx_t first_idx,
+                                                      idx_t last_idx) {
+	std::vector<LTTBPoint> candidates;
+	candidates.reserve(2 + 2 * bins.size());
+	candidates.push_back(points[first_idx]);
+	for (const auto &bin : bins) {
+		if (!bin.has_data) {
+			continue;
+		}
+		if (bin.count == 1) {
+			candidates.push_back(bin.first_point);
+		} else if (bin.count == 2) {
+			// Keep both points; argmin/argmax collapse equal-y pairs to one
+			// index, so the second point must come from explicit tracking.
+			if (bin.first_point.x <= bin.second_point.x) {
+				candidates.push_back(bin.first_point);
+				candidates.push_back(bin.second_point);
+			} else {
+				candidates.push_back(bin.second_point);
+				candidates.push_back(bin.first_point);
+			}
+		} else {
+			// count > 2: keep argmin(y) and argmax(y). When every point in the
+			// bin shares the same y, min_idx == max_idx (both the first point),
+			// so push a single representative to avoid a duplicate candidate
+			// (harmless to LTTB but wastes a slot and skews the next-bucket
+			// average).
+			if (bin.min_idx == bin.max_idx) {
+				candidates.push_back(bin.min_point);
+			} else if (bin.min_point.x <= bin.max_point.x) {
+				candidates.push_back(bin.min_point);
+				candidates.push_back(bin.max_point);
+			} else {
+				candidates.push_back(bin.max_point);
+				candidates.push_back(bin.min_point);
+			}
+		}
+	}
+	// Guard against all-x-equal: first_idx == last_idx would duplicate the
+	// endpoint. Only push last when it is a distinct point.
+	if (last_idx != first_idx) {
+		candidates.push_back(points[last_idx]);
+	}
+	return candidates;
+}
+
+// Bin-first MinMax preselect + LTTB. O(n) binning + O(k log k) candidate sort
+// shrinks the full dataset to ~n*ratio candidates, then LTTB runs over them.
+// Degenerate cases (n_out=0, n<=n_out, ratio<=1, n/ratio<=n_out) bypass
+// preselect and run standard LTTB directly. See docs/architecture.md §4.7.
+static std::vector<LTTBPoint> MinMaxLTTBDownsample(std::vector<LTTBPoint> &points, uint64_t n_out, int64_t minmax_ratio,
+                                                   bool skip_sort) {
+	const auto n = points.size();
+	if (n_out == 0) {
+		return {};
+	}
+	if (n <= n_out || minmax_ratio <= 1 || n / static_cast<uint64_t>(minmax_ratio) <= n_out) {
+		return Downsample(points, n_out, skip_sort);
+	}
+
+	const auto range = FindXRangeEndpoints(points);
+	const auto n_minmax_buckets = (n_out * static_cast<uint64_t>(minmax_ratio)) / 2;
+	auto bins = BuildMinMaxBins(points, n_minmax_buckets, range.first_idx, range.last_idx, range.x_min, range.x_max);
+	auto candidates = CollectMinMaxCandidates(points, bins, range.first_idx, range.last_idx);
+	// Step 4: sort candidates by x, then run LTTB (skip_sort=true).
+	std::stable_sort(candidates.begin(), candidates.end(), LessByX);
+	return Downsample(candidates, n_out, true);
+}
+
+// Two-stage finalize: delegates per-group downsampling to MinMaxLTTBDownsample
+// and writes the typed STRUCT(x, y)[] result.
 static void MinMaxLTTBFinalize(Vector &state_vector, AggregateInputData &input_data, Vector &result, idx_t count,
                                idx_t offset) {
 	UnifiedVectorFormat state_data;
@@ -883,148 +1088,7 @@ static void MinMaxLTTBFinalize(Vector &state_vector, AggregateInputData &input_d
 		if (state.has_buckets && state.points) {
 			const auto n_out = static_cast<uint64_t>(state.buckets & 0xFFFFFFFFULL);
 			const auto minmax_ratio = static_cast<int64_t>(state.buckets >> 32);
-			auto &points = *state.points;
-			const auto n = points.size();
-			// Degenerate cases bypass bin-first:
-			//   n_out=0 → empty; n<=n_out → all points (via Downsample);
-			//   ratio<=1 or n/ratio<=n_out → preselect won't help, run
-			//   standard LTTB directly (Downsample handles sort via skip_sort).
-			if (n_out == 0) {
-				sampled = {};
-			} else if (n <= n_out) {
-				sampled = Downsample(points, n_out, skip_sort);
-			} else if (minmax_ratio <= 1 || n / static_cast<uint64_t>(minmax_ratio) <= n_out) {
-				sampled = Downsample(points, n_out, skip_sort);
-			} else {
-				// Bin-first MinMax preselect: O(n) binning + O(k log k) candidate
-				// sort. See docs/architecture.md §4.7 for rationale & benchmarks.
-				double x_min = std::numeric_limits<double>::max();
-				double x_max = std::numeric_limits<double>::lowest();
-				idx_t first_idx = 0;
-				idx_t last_idx = 0;
-				for (idx_t i = 0; i < n; i++) {
-					if (points[i].x < x_min) {
-						x_min = points[i].x;
-						first_idx = i;
-					}
-					if (points[i].x > x_max) {
-						x_max = points[i].x;
-						last_idx = i;
-					}
-				}
-
-				// Step 2: bin interior points (excluding first/last) into equi-width
-				// x-range bins, keeping argmin(y)/argmax(y) per bin.
-				const auto n_minmax_buckets = (n_out * static_cast<uint64_t>(minmax_ratio)) / 2;
-				struct PerBin {
-					// First two points seen, kept verbatim so count<=2 bins retain
-					// both points even when y is constant (argmin/argmax tracking
-					// collapses equal-y points to a single index).
-					LTTBPoint first_point;
-					LTTBPoint second_point;
-					idx_t first_idx;
-					idx_t second_idx;
-					// argmin(y) / argmax(y) over the bin, used when count > 2.
-					LTTBPoint min_point;
-					LTTBPoint max_point;
-					idx_t min_idx;
-					idx_t max_idx;
-					uint64_t count;
-					bool has_data;
-				};
-				std::vector<PerBin> bins(n_minmax_buckets);
-				const double x_range = x_max - x_min;
-				const double inv_bin_width = (x_range > 0.0) ? static_cast<double>(n_minmax_buckets) / x_range : 0.0;
-
-				for (idx_t i = 0; i < n; i++) {
-					if (i == first_idx || i == last_idx) {
-						continue;
-					}
-					uint64_t bin_idx;
-					if (x_range <= 0.0) {
-						bin_idx = 0;
-					} else {
-						bin_idx = static_cast<uint64_t>((points[i].x - x_min) * inv_bin_width);
-						if (bin_idx >= n_minmax_buckets) {
-							bin_idx = n_minmax_buckets - 1;
-						}
-					}
-					auto &bin = bins[bin_idx];
-					if (!bin.has_data) {
-						bin.first_point = points[i];
-						bin.first_idx = i;
-						bin.min_point = points[i];
-						bin.max_point = points[i];
-						bin.min_idx = i;
-						bin.max_idx = i;
-						bin.count = 1;
-						bin.has_data = true;
-					} else {
-						bin.count++;
-						if (bin.count == 2) {
-							bin.second_point = points[i];
-							bin.second_idx = i;
-						}
-						if (points[i].y < bin.min_point.y) {
-							bin.min_point = points[i];
-							bin.min_idx = i;
-						}
-						if (points[i].y > bin.max_point.y) {
-							bin.max_point = points[i];
-							bin.max_idx = i;
-						}
-					}
-				}
-
-				// Step 3: candidate set = first + per-bin argmin/argmax + last.
-				// Push min/max in x-order so the subsequent sort is stable.
-				std::vector<LTTBPoint> candidates;
-				candidates.reserve(2 + 2 * n_minmax_buckets);
-				candidates.push_back(points[first_idx]);
-				for (auto &bin : bins) {
-					if (!bin.has_data) {
-						continue;
-					}
-					if (bin.count == 1) {
-						candidates.push_back(bin.first_point);
-					} else if (bin.count == 2) {
-						// Keep both points; argmin/argmax collapse equal-y pairs to one
-						// index, so the second point must come from explicit tracking.
-						if (bin.first_point.x <= bin.second_point.x) {
-							candidates.push_back(bin.first_point);
-							candidates.push_back(bin.second_point);
-						} else {
-							candidates.push_back(bin.second_point);
-							candidates.push_back(bin.first_point);
-						}
-					} else {
-						// count > 2: keep argmin(y) and argmax(y). When every point in
-						// the bin shares the same y, min_idx == max_idx (both the first
-						// point), so push a single representative to avoid a duplicate
-						// candidate (harmless to LTTB but wastes a slot and skews the
-						// next-bucket average).
-						if (bin.min_idx == bin.max_idx) {
-							candidates.push_back(bin.min_point);
-						} else if (bin.min_point.x <= bin.max_point.x) {
-							candidates.push_back(bin.min_point);
-							candidates.push_back(bin.max_point);
-						} else {
-							candidates.push_back(bin.max_point);
-							candidates.push_back(bin.min_point);
-						}
-					}
-				}
-				// Guard against all-x-equal: first_idx == last_idx would duplicate
-				// the endpoint. Only push last when it is a distinct point.
-				if (last_idx != first_idx) {
-					candidates.push_back(points[last_idx]);
-				}
-
-				// Step 4: sort candidates by x, then run LTTB (skip_sort=true).
-				std::stable_sort(candidates.begin(), candidates.end(),
-				                 [](const LTTBPoint &lhs, const LTTBPoint &rhs) { return lhs.x < rhs.x; });
-				sampled = Downsample(candidates, n_out, true);
-			}
+			sampled = MinMaxLTTBDownsample(*state.points, n_out, minmax_ratio, skip_sort);
 		}
 		ListVector::Reserve(result, total_size + sampled.size());
 
@@ -1162,28 +1226,14 @@ static void BucketStatsUpdate(Vector inputs[], AggregateInputData &input_data, i
 		if (buckets_input < 0) {
 			throw InvalidInputException("bucket_stats bucket count must be non-negative");
 		}
-		const auto buckets = static_cast<uint64_t>(buckets_input);
-		if (!state.has_buckets) {
-			state.buckets = buckets;
-			state.has_buckets = true;
-		} else if (state.buckets != buckets) {
-			throw InvalidInputException("bucket_stats bucket count must be constant within each aggregate group");
-		}
+		SetBucketCount(state, static_cast<uint64_t>(buckets_input), "bucket_stats");
 
 		const auto x = x_read(x_data, row, x_type);
 		const auto y = y_read(y_data, row, y_type);
 		if (!IsValidPoint(x, y)) {
 			continue;
 		}
-		if (!state.points) {
-			state.points = new std::vector<LTTBPoint>();
-			state.points->reserve(256);
-		}
-		if (state.points->size() >= MAX_LTTB_POINTS) {
-			throw InvalidInputException("bucket_stats aggregate state exceeded maximum point count of " +
-			                            std::to_string(MAX_LTTB_POINTS));
-		}
-		state.points->push_back({x, y});
+		PushPoint(state, x, y, "bucket_stats");
 	}
 }
 
@@ -1203,6 +1253,99 @@ static LogicalType BucketStatsReturnType(const LogicalType &x_type, const Logica
 	return LogicalType::LIST(LogicalType::STRUCT(std::move(struct_children)));
 }
 
+// Computed distribution stats for a single bucket over y. Population std
+// (÷N). start_x/end_x are the typed x bounds; first_y/last_y preserve y_type.
+struct BucketStatsRow {
+	idx_t count;
+	double start_x;
+	double end_x;
+	double min_y;
+	double max_y;
+	double mean;
+	double std_val;
+	double first_y;
+	double last_y;
+};
+
+// Bundle of output child vectors and typed write functions, passed to the row
+// writer so its signature stays small.
+struct BucketStatsSink {
+	Vector &bucket_start;
+	Vector &bucket_end;
+	Vector &count;
+	Vector &min;
+	Vector &max;
+	Vector &mean;
+	Vector &std;
+	Vector &first;
+	Vector &last;
+	WriteFunc x_write;
+	WriteFunc y_write;
+	const LogicalType &x_type;
+	const LogicalType &y_type;
+};
+
+// Single linear scan over [b_start, b_end) computing count, min, max, mean,
+// population std, first, last. count>=1 is assumed by the callers.
+static BucketStatsRow ComputeBucketStats(const std::vector<LTTBPoint> &points, idx_t b_start, idx_t b_end) {
+	double min_y = points[b_start].y;
+	double max_y = points[b_start].y;
+	double sum = 0;
+	double sum_sq = 0;
+	for (idx_t i = b_start; i < b_end; i++) {
+		const double y = points[i].y;
+		min_y = MinValue(min_y, y);
+		max_y = MaxValue(max_y, y);
+		sum += y;
+		sum_sq += y * y;
+	}
+	const auto count = b_end - b_start;
+	const double mean = sum / static_cast<double>(count);
+	const double variance = sum_sq / static_cast<double>(count) - mean * mean;
+	return {count,
+	        points[b_start].x,
+	        points[b_end - 1].x,
+	        min_y,
+	        max_y,
+	        mean,
+	        std::sqrt(std::max(0.0, variance)),
+	        points[b_start].y,
+	        points[b_end - 1].y};
+}
+
+// Write one bucket struct entry at `offset` into the result child vectors.
+static void WriteBucketStatsRow(const BucketStatsSink &sink, idx_t offset, const BucketStatsRow &row) {
+	sink.x_write(sink.bucket_start, offset, row.start_x, sink.x_type);
+	sink.x_write(sink.bucket_end, offset, row.end_x, sink.x_type);
+	FlatVector::GetData<int64_t>(sink.count)[offset] = static_cast<int64_t>(row.count);
+	sink.y_write(sink.min, offset, row.min_y, sink.y_type);
+	sink.y_write(sink.max, offset, row.max_y, sink.y_type);
+	FlatVector::GetData<double>(sink.mean)[offset] = row.mean;
+	FlatVector::GetData<double>(sink.std)[offset] = row.std_val;
+	sink.y_write(sink.first, offset, row.first_y, sink.y_type);
+	sink.y_write(sink.last, offset, row.last_y, sink.y_type);
+}
+
+// Half-open index bounds for one bucket_stats bucket. First and last buckets
+// are singletons; interior buckets use the equal-count-by-index LTTB formula.
+struct BucketBounds {
+	idx_t start;
+	idx_t end;
+};
+
+static BucketBounds ComputeBucketBounds(uint64_t bucket, uint64_t num_buckets, idx_t n, double bucket_width) {
+	if (bucket == 0) {
+		return {0, 1};
+	}
+	if (bucket == num_buckets - 1) {
+		return {n - 1, n};
+	}
+	const auto start = static_cast<idx_t>(std::floor(static_cast<double>(bucket - 1) * bucket_width)) + 1;
+	const auto end =
+	    MinValue<idx_t>(static_cast<idx_t>(std::floor(static_cast<double>(bucket) * bucket_width)) + 1, n - 1);
+	return {start, end};
+}
+
 // Compute per-bucket distribution stats (count, min, max, mean, std, first,
 // last) over y using equal-count-by-index bucketing (same formula as LTTB).
 // No sort or triangle computation — a single linear scan per bucket.
@@ -1215,146 +1358,64 @@ static void BucketStatsFinalize(Vector &state_vector, AggregateInputData &input_
 	auto &child_vector = ListVector::GetEntry(result);
 	auto &struct_entries = StructVector::GetEntries(child_vector);
 	// Struct children: bucket_start, bucket_end, count, min, max, mean, std, first, last
-	auto &bucket_start_child = *struct_entries[0];
-	auto &bucket_end_child = *struct_entries[1];
-	auto &count_child = *struct_entries[2];
-	auto &min_child = *struct_entries[3];
-	auto &max_child = *struct_entries[4];
-	auto &mean_child = *struct_entries[5];
-	auto &std_child = *struct_entries[6];
-	auto &first_child = *struct_entries[7];
-	auto &last_child = *struct_entries[8];
-	const auto &x_type = bucket_start_child.GetType();
-	const auto &y_type = min_child.GetType();
-
 	auto &bind_data = input_data.bind_data->Cast<BucketStatsFunctionData>();
-	const auto x_write = bind_data.x_write;
-	const auto y_write = bind_data.y_write;
+	BucketStatsSink sink {*struct_entries[0],          *struct_entries[1], *struct_entries[2],
+	                      *struct_entries[3],          *struct_entries[4], *struct_entries[5],
+	                      *struct_entries[6],          *struct_entries[7], *struct_entries[8],
+	                      bind_data.x_write,           bind_data.y_write,  struct_entries[0]->GetType(),
+	                      struct_entries[3]->GetType()};
 
 	idx_t total_size = ListVector::GetListSize(result);
 	for (idx_t row = 0; row < count; row++) {
 		auto &state = *states[state_data.sel->get_index(row)];
+		const idx_t entry_offset = total_size;
+		idx_t entry_length = 0;
+
 		if (state.has_buckets && state.points) {
 			auto &points = *state.points;
 			// Stable sort by x (bucket_stats does not have a sorted variant).
-			std::stable_sort(points.begin(), points.end(),
-			                 [](const LTTBPoint &lhs, const LTTBPoint &rhs) { return lhs.x < rhs.x; });
+			std::stable_sort(points.begin(), points.end(), LessByX);
 			const auto n = points.size();
 			const auto num_buckets = state.buckets;
 
-			if (num_buckets == 0) {
-				// empty — fall through to empty entry below.
-			} else if (n <= num_buckets) {
-				// Each point is its own bucket (count=1, std=0).
-				ListVector::Reserve(result, total_size + n);
-				for (idx_t i = 0; i < n; i++) {
-					x_write(bucket_start_child, total_size, points[i].x, x_type);
-					x_write(bucket_end_child, total_size, points[i].x, x_type);
-					FlatVector::GetData<int64_t>(count_child)[total_size] = 1;
-					y_write(min_child, total_size, points[i].y, y_type);
-					y_write(max_child, total_size, points[i].y, y_type);
-					FlatVector::GetData<double>(mean_child)[total_size] = points[i].y;
-					FlatVector::GetData<double>(std_child)[total_size] = 0.0;
-					y_write(first_child, total_size, points[i].y, y_type);
-					y_write(last_child, total_size, points[i].y, y_type);
-					total_size += 1;
-				}
-				auto &entry = list_entries[row + offset];
-				entry.offset = total_size - n;
-				entry.length = n;
-				ListVector::SetListSize(result, total_size);
-				continue;
-			} else if (num_buckets == 1) {
-				// Single bucket: all points.
-				double min_y = points[0].y, max_y = points[0].y;
-				double first_y = points[0].y, last_y = points[n - 1].y;
-				double sum = 0, sum_sq = 0;
-				for (idx_t i = 0; i < n; i++) {
-					const double y = points[i].y;
-					min_y = MinValue(min_y, y);
-					max_y = MaxValue(max_y, y);
-					sum += y;
-					sum_sq += y * y;
-				}
-				const double mean = sum / static_cast<double>(n);
-				const double variance = sum_sq / static_cast<double>(n) - mean * mean;
-				const double std = std::sqrt(std::max(0.0, variance));
-				// Write as a single struct entry.
-				ListVector::Reserve(result, total_size + 1);
-				x_write(bucket_start_child, total_size, points[0].x, x_type);
-				x_write(bucket_end_child, total_size, points[n - 1].x, x_type);
-				FlatVector::GetData<int64_t>(count_child)[total_size] = static_cast<int64_t>(n);
-				y_write(min_child, total_size, min_y, y_type);
-				y_write(max_child, total_size, max_y, y_type);
-				FlatVector::GetData<double>(mean_child)[total_size] = mean;
-				FlatVector::GetData<double>(std_child)[total_size] = std;
-				y_write(first_child, total_size, first_y, y_type);
-				y_write(last_child, total_size, last_y, y_type);
-				auto &entry = list_entries[row + offset];
-				entry.offset = total_size;
-				entry.length = 1;
-				total_size += 1;
-				ListVector::SetListSize(result, total_size);
-				continue;
-			} else {
-				// Equal-count-by-index bucketing (LTTB formula).
-				// First and last points are singletons; interior divided into
-				// num_buckets-2 buckets of width (n-2)/(num_buckets-2).
-				const double bucket_width = static_cast<double>(n - 2) / static_cast<double>(num_buckets - 2);
-				for (uint64_t bucket = 0; bucket < num_buckets; bucket++) {
-					idx_t b_start, b_end;
-					if (bucket == 0) {
-						b_start = 0;
-						b_end = 1;
-					} else if (bucket == num_buckets - 1) {
-						b_start = n - 1;
-						b_end = n;
-					} else {
-						b_start = static_cast<idx_t>(std::floor(static_cast<double>(bucket - 1) * bucket_width)) + 1;
-						b_end = MinValue<idx_t>(
-						    static_cast<idx_t>(std::floor(static_cast<double>(bucket) * bucket_width)) + 1, n - 1);
+			if (num_buckets != 0 && n != 0) {
+				if (n <= num_buckets) {
+					// Each point is its own bucket (count=1, std=0).
+					ListVector::Reserve(result, total_size + n);
+					for (idx_t i = 0; i < n; i++) {
+						WriteBucketStatsRow(sink, total_size, ComputeBucketStats(points, i, i + 1));
+						total_size++;
 					}
-					const auto b_count = b_end - b_start;
-					if (b_count == 0) {
-						continue;
-					}
-					double min_y = points[b_start].y, max_y = points[b_start].y;
-					double first_y = points[b_start].y, last_y = points[b_end - 1].y;
-					double sum = 0, sum_sq = 0;
-					for (idx_t i = b_start; i < b_end; i++) {
-						const double y = points[i].y;
-						min_y = MinValue(min_y, y);
-						max_y = MaxValue(max_y, y);
-						sum += y;
-						sum_sq += y * y;
-					}
-					const double mean = sum / static_cast<double>(b_count);
-					const double variance = sum_sq / static_cast<double>(b_count) - mean * mean;
-					const double std_val = std::sqrt(std::max(0.0, variance));
-
+					entry_length = n;
+				} else if (num_buckets == 1) {
+					// Single bucket: all points.
 					ListVector::Reserve(result, total_size + 1);
-					x_write(bucket_start_child, total_size, points[b_start].x, x_type);
-					x_write(bucket_end_child, total_size, points[b_end - 1].x, x_type);
-					FlatVector::GetData<int64_t>(count_child)[total_size] = static_cast<int64_t>(b_count);
-					y_write(min_child, total_size, min_y, y_type);
-					y_write(max_child, total_size, max_y, y_type);
-					FlatVector::GetData<double>(mean_child)[total_size] = mean;
-					FlatVector::GetData<double>(std_child)[total_size] = std_val;
-					y_write(first_child, total_size, first_y, y_type);
-					y_write(last_child, total_size, last_y, y_type);
-					total_size += 1;
+					WriteBucketStatsRow(sink, total_size, ComputeBucketStats(points, 0, n));
+					total_size++;
+					entry_length = 1;
+				} else {
+					// Equal-count-by-index bucketing (LTTB formula).
+					// First and last points are singletons; interior divided into
+					// num_buckets-2 buckets of width (n-2)/(num_buckets-2).
+					ListVector::Reserve(result, total_size + num_buckets);
+					const double bucket_width = static_cast<double>(n - 2) / static_cast<double>(num_buckets - 2);
+					for (uint64_t bucket = 0; bucket < num_buckets; bucket++) {
+						const auto bounds = ComputeBucketBounds(bucket, num_buckets, n, bucket_width);
+						if (bounds.end <= bounds.start) {
+							continue;
+						}
+						WriteBucketStatsRow(sink, total_size, ComputeBucketStats(points, bounds.start, bounds.end));
+						total_size++;
+					}
+					entry_length = total_size - entry_offset;
 				}
-				auto &entry = list_entries[row + offset];
-				entry.offset = total_size - num_buckets;
-				entry.length = num_buckets;
 				ListVector::SetListSize(result, total_size);
-				continue;
 			}
 		}
-		// Empty or no state.
+
 		auto &entry = list_entries[row + offset];
-		entry.offset = total_size;
-		entry.length = 0;
+		entry.offset = entry_offset;
+		entry.length = entry_length;
 	}
 	ListVector::SetListSize(result, total_size);
 }
