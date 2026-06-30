@@ -1,7 +1,7 @@
 [project]
 name = "duckdb-lttb"
 version = "0.1.0"
-description = "Add your description here"
+description = "DuckDB extension implementing Largest-Triangle-Three-Buckets downsampling as aggregate functions."
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = []
