@@ -106,4 +106,5 @@ the `code-quality-check` job. See `CONTRIBUTING.md` for hook installation.
 
 ## Skills (loaded on-demand)
 
+- C++ implementation / refactoring / review → follow `.agents/skills/cpp-best-practices/`
 - Vibe coding workflow / AI coding constraints → follow `.agents/skills/reform/`
