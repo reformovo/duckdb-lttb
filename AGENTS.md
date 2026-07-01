@@ -4,7 +4,7 @@ Loaded every session. Supplement to mechanical constraints (lint/test/CI), not a
 
 ## Stack
 
-C++17, DuckDB extension (v1.5.2), CMake + Ninja, SQLLogicTest.
+C++17, DuckDB extension (v1.5.4), CMake + Ninja, SQLLogicTest.
 Single-file implementation: `src/lttb_extension.cpp` (~1450 lines).
 No external runtime/build dependencies.
 
@@ -45,7 +45,7 @@ docs/                          Architecture, benchmark, reference docs
 ## Boundaries
 
 - **Always**: run format-check + focused tests before declaring done.
-- **Ask first**: changing DuckDB version (v1.5.2), modifying `CMakeLists.txt`,
+- **Ask first**: changing DuckDB version (v1.5.4), modifying `CMakeLists.txt`,
   adding dependencies, changing `.clang-format`/`.clang-tidy`.
 - **Never**: push to main, commit `build/`, disable lint rules inline, modify submodules.
 
