@@ -80,7 +80,8 @@ Compared to ClickHouse and the Python `lttb` package, this extension:
 
 This extension currently has no external runtime/build dependencies beyond the DuckDB extension template toolchain.
 
-The template OpenSSL/vcpkg example dependency has been removed, so `vcpkg.json` is intentionally absent and `VCPKG_TOOLCHAIN_PATH` is not required.
+The template OpenSSL dependency has been removed. `vcpkg.json` only configures DuckDB extension-template overlay ports
+and triplets; it does not add runtime dependencies.
 
 ## Building
 
@@ -112,6 +113,15 @@ Main build outputs:
 ```
 
 ## Running
+
+After the extension is published as a DuckDB community extension:
+
+```sql
+INSTALL lttb FROM community;
+LOAD lttb;
+```
+
+For a local development build:
 
 ```sh
 ./build/release/duckdb -unsigned
