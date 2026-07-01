@@ -1,6 +1,12 @@
 {
   "version": 1,
   "skills": {
+    "cpp-best-practices": {
+      "source": "reformovo/skills",
+      "sourceType": "github",
+      "skillPath": "skills/cpp-best-practices/SKILL.md",
+      "computedHash": "f5f1872d7e806941fa8af22ba2c4a10deb22077868366a83328b6c56b76abffc"
+    },
     "reform": {
       "source": "reformovo/skills",
       "sourceType": "github",
