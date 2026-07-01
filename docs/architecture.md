@@ -1,387 +1,422 @@
-# duckdb-lttb 架构文档
+# duckdb-lttb Architecture
 
-## 1. 项目概述
+## 1. Project Overview
 
-`duckdb-lttb` 是一个 DuckDB 扩展，实现了 **LTTB（Largest-Triangle-Three-Buckets）** 时间序列降采样算法。LTTB 由 Sveinn Steinarsson 在 2013 年的硕士论文中提出，是一种专为可视化设计的降采样方法：在将大量数据点缩减到少量点的同时，尽可能保持原始曲线的视觉特征。
+`duckdb-lttb` is a DuckDB extension that implements the **LTTB (Largest-Triangle-Three-Buckets)** time-series downsampling algorithm. LTTB was introduced by Sveinn Steinarsson in his 2013 master's thesis. It is designed for visualization: it reduces a large number of data points to a smaller set while preserving the visual shape of the original curve as much as possible.
 
-本扩展将 LTTB 实现为 DuckDB 的**聚合函数（Aggregate Function）**，使其可以直接在 SQL 查询中使用，无需将数据导出到 Python/R 等外部环境。行为参考了 ClickHouse 的 `largestTriangleThreeBuckets` / `lttb` 实现，并在类型保持、排序稳定性、边界处理等方面做了改进。
+The extension exposes LTTB as DuckDB **aggregate functions**, so it can be used directly in SQL without exporting data to Python, R, or another external runtime. The behavior is based on ClickHouse's `largestTriangleThreeBuckets` / `lttb` aggregate, with additional work around type preservation, deterministic sorting, and edge-case handling.
 
-### 提供的函数
+### Provided Functions
 
-| 函数 | 说明 | 返回类型 |
+| Function | Description | Return Type |
 |---|---|---|
-| `lttb(x, y, n)` | 降采样到 `n` 个点，内部按 `x` 排序后采样 | `STRUCT(x typed, y typed)[]` |
-| `largestTriangleThreeBuckets(x, y, n)` | `lttb` 的别名 | 同上 |
-| `lttb_sorted(x, y, n)` | 与 `lttb` 相同，但跳过排序。调用方需保证输入已按 `x` 排序 | 同上 |
-| `lttb_indices(x, y, n)` | 与 `lttb` 相同的选点逻辑，但返回选中点的排序后位置索引 | `BIGINT[]` |
-| `minmax_lttb(x, y, n, minmax_ratio)` | 两阶段 MinMax 预选 + LTTB。`minmax_ratio` 默认 4。近似算法，非精确 LTTB | `STRUCT(x typed, y typed)[]` |
-| `minmax_lttb_sorted(x, y, n, minmax_ratio)` | 与 `minmax_lttb` 相同，但跳过排序。调用方需保证输入已按 `x` 排序 | 同上 |
-| `bucket_stats(x, y, num_buckets)` | 每桶统计降采样，返回 y 的分布统计（count/min/max/mean/std/first/last） | `STRUCT(bucket_start, bucket_end, count, min, max, mean, std, first, last)[]` |
+| `lttb(x, y, n)` | Downsample to `n` points after sorting by `x` internally. | `STRUCT(x typed, y typed)[]` |
+| `largestTriangleThreeBuckets(x, y, n)` | Alias for `lttb`. | Same as above |
+| `lttb_sorted(x, y, n)` | Same as `lttb`, but skips sorting. The caller must guarantee input is sorted by `x`. | Same as above |
+| `lttb_indices(x, y, n)` | Uses the same point-selection logic as `lttb`, but returns selected 0-based positions in sorted order. | `BIGINT[]` |
+| `minmax_lttb(x, y, n, minmax_ratio)` | Two-stage MinMax preselection plus LTTB. `minmax_ratio` defaults to 4. This is approximate, not exact LTTB. | `STRUCT(x typed, y typed)[]` |
+| `minmax_lttb_sorted(x, y, n, minmax_ratio)` | Same as `minmax_lttb`, but assumes input is already sorted by `x`. | Same as above |
+| `bucket_stats(x, y, num_buckets)` | Equal-count bucket statistics for y: count, min, max, mean, std, first, and last. | `STRUCT(bucket_start, bucket_end, count, min, max, mean, std, first, last)[]` |
 
-### 支持的输入类型
+### Supported Input Types
 
-`x` 和 `y` 均接受以下类型：
+Both `x` and `y` accept:
 
-- **浮点**：`DOUBLE`、`FLOAT`
-- **有符号整数**：`TINYINT`、`SMALLINT`、`INTEGER`、`BIGINT`、`HUGEINT`
-- **无符号整数**：`UTINYINT`、`USMALLINT`、`UINTEGER`、`UBIGINT`、`UHUGEINT`
-- **时间**：`DATE`、`TIMESTAMP`、`TIMESTAMP_TZ`、`TIMESTAMP_S`、`TIMESTAMP_MS`、`TIMESTAMP_NS`
-- **十进制**：`DECIMAL`
+- **Floating point**: `DOUBLE`, `FLOAT`
+- **Signed integers**: `TINYINT`, `SMALLINT`, `INTEGER`, `BIGINT`, `HUGEINT`
+- **Unsigned integers**: `UTINYINT`, `USMALLINT`, `UINTEGER`, `UBIGINT`, `UHUGEINT`
+- **Temporal types**: `DATE`, `TIMESTAMP`, `TIMESTAMP_TZ`, `TIMESTAMP_S`, `TIMESTAMP_MS`, `TIMESTAMP_NS`
+- **Decimal values**: `DECIMAL`
 
-输出保持 `x` 和 `y` 的原始类型，匹配 ClickHouse `Array(Tuple(typed_x, typed_y))` 的语义。
-
----
-
-## 2. 架构总览
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                      SQL 查询层                              │
-│  SELECT lttb(x, y, 1000) FROM metrics WHERE project='p1'   │
-│  SELECT minmax_lttb(x, y, 1000, 4) FROM metrics             │
-│  SELECT bucket_stats(x, y, 100) FROM metrics                 │
-└──────────────────────────┬──────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│              DuckDB 函数绑定层 (Bind)                        │
-│                                                             │
-│  LTTBBindFunctionImpl / MinMaxLTTBBindFunction / ...         │
-│    ├─ 校验 x/y 类型是否在支持集合内                           │
-│    ├─ SQLNULL → DOUBLE 强制转换（向后兼容）                   │
-│    ├─ 设置 function.arguments 为具体类型                     │
-│    ├─ 设置 function.SetReturnType 为 LIST(STRUCT(...))      │
-│    ├─ MakeReader/MakeWriter 解析类型为函数指针               │
-│    └─ 返回 FunctionData (携带 sorted 标志 + 函数指针)        │
-└──────────────────────────┬──────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│              聚合执行层 (Aggregate Lifecycle)                │
-│                                                             │
-│  Initialize → Update → [Combine] → Finalize → Destroy       │
-│                                                             │
-│  Update:   x_read/y_read 函数指针将类型化输入转为 double     │
-│  Combine:  指针转移或 reserve+insert 合并部分状态             │
-│  Finalize: Downsample 执行 LTTB 算法                         │
-│            (或 MinMax 预选 + LTTB / 桶统计)                  │
-│            x_write/y_write 函数指针将 double 转回类型化输出   │
-│  Destroy:  释放堆分配的 vector                               │
-└──────────────────────────┬──────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│              LTTB 算法核心 (Downsample)                      │
-│                                                             │
-│  stable_sort → 分桶 → 逐桶选最大三角形面积点 → 返回采样结果   │
-│  可选: skip_sort (lttb_sorted) / out_indices (lttb_indices) │
-│                                                             │
-│  MinMax 预选 (bin-first): 等宽 x 区间分桶 → 每桶 argmin/argmax(y) │
-│  BucketStatsFinalize: 等计数分桶 → 每桶统计聚合              │
-└─────────────────────────────────────────────────────────────┘
-```
-
-核心设计原则：**算法在 `double` 上运行，类型转换只发生在 I/O 边界**。这使得 LTTB 算法本身与输入类型完全解耦，类型保持成为一个独立的 I/O 关注点。类型分发在 bind 时解析为函数指针（`MakeReader`/`MakeWriter`），Update/Finalize 每行直接调用，避免循环内的 switch 分发。
+The output preserves the original `x` and `y` logical types, matching ClickHouse's `Array(Tuple(typed_x, typed_y))` style of behavior.
 
 ---
 
-## 3. 代码结构
+## 2. Architecture Overview
 
-整个扩展的实现集中在单个文件 `src/lttb_extension.cpp`（约 1480 行）中，按功能分为以下几个部分：
+```text
++-------------------------------------------------------------+
+|                         SQL layer                           |
+|  SELECT lttb(x, y, 1000) FROM metrics WHERE project='p1'   |
+|  SELECT minmax_lttb(x, y, 1000, 4) FROM metrics             |
+|  SELECT bucket_stats(x, y, 100) FROM metrics                |
++----------------------------+--------------------------------+
+                             |
+                             v
++-------------------------------------------------------------+
+|                    DuckDB bind layer                        |
+|                                                             |
+|  LTTBBindFunctionImpl / MinMaxLTTBBindFunction / ...         |
+|    - Validate that x/y types are supported                  |
+|    - Coerce SQLNULL to DOUBLE for compatibility             |
+|    - Set concrete function argument types                   |
+|    - Set return type to LIST(STRUCT(...))                   |
+|    - Resolve MakeReader/MakeWriter to function pointers     |
+|    - Return FunctionData with flags and function pointers   |
++----------------------------+--------------------------------+
+                             |
+                             v
++-------------------------------------------------------------+
+|                 Aggregate lifecycle layer                   |
+|                                                             |
+|  Initialize -> Update -> [Combine] -> Finalize -> Destroy   |
+|                                                             |
+|  Update:   x_read/y_read convert typed input to double      |
+|  Combine:  pointer transfer or reserve+insert               |
+|  Finalize: Downsample runs LTTB                             |
+|            or MinMax preselection + LTTB / bucket stats     |
+|            x_write/y_write convert double back to typed out |
+|  Destroy:  release heap-allocated vector                    |
++----------------------------+--------------------------------+
+                             |
+                             v
++-------------------------------------------------------------+
+|                    Algorithm layer                          |
+|                                                             |
+|  stable_sort -> bucketing -> max-triangle point selection   |
+|  Optional: skip_sort for lttb_sorted, indices for lttb_indices |
+|                                                             |
+|  MinMax preselection: equal-width x bins -> argmin/argmax(y) |
+|  Bucket stats: equal-count buckets -> statistical aggregate |
++-------------------------------------------------------------+
+```
 
-### 3.1 数据结构定义
+The central design principle is: **the algorithm runs on `double`, and type conversion happens only at the I/O boundary**. This decouples the LTTB algorithm from the input logical types and makes type preservation an independent input/output concern. Type dispatch is resolved at bind time into function pointers through `MakeReader` and `MakeWriter`; Update and Finalize call those pointers directly for each row, avoiding a type switch inside tight loops.
+
+---
+
+## 3. Code Structure
+
+The implementation lives in a single file, `src/lttb_extension.cpp`, about 1480 lines, organized into the following sections.
+
+### 3.1 Data Structures
 
 ```cpp
-struct LTTBPoint { double x, y; };           // 算法内部的数据点
-struct LTTBState { ... };                     // 聚合状态
-struct LTTBFunctionData : public FunctionData { ... };  // Bind 数据（lttb 系列）
-struct MinMaxLTTBFunctionData : public FunctionData { ... };  // minmax_lttb Bind 数据
-struct BucketStatsFunctionData : public FunctionData { ... };  // bucket_stats Bind 数据
+struct LTTBPoint { double x, y; };                    // Internal algorithm point
+struct LTTBState { ... };                             // Aggregate state
+struct LTTBFunctionData : public FunctionData { ... };       // lttb family bind data
+struct MinMaxLTTBFunctionData : public FunctionData { ... };  // minmax_lttb bind data
+struct BucketStatsFunctionData : public FunctionData { ... }; // bucket_stats bind data
 ```
 
-### 3.2 类型转换：函数指针分发
+### 3.2 Type Conversion Through Function Pointers
 
 ```cpp
 using ReadFunc = double (*)(const UnifiedVectorFormat &, idx_t, const LogicalType &);
 using WriteFunc = void (*)(Vector &, idx_t, double, const LogicalType &);
-static ReadFunc MakeReader(const LogicalType &type);   // bind 时解析类型 → 读函数指针
-static WriteFunc MakeWriter(const LogicalType &type);  // bind 时解析类型 → 写函数指针
-static bool IsLTTBSupportedType(...);                   // 类型校验
+static ReadFunc MakeReader(const LogicalType &type);   // bind-time type -> reader
+static WriteFunc MakeWriter(const LogicalType &type);  // bind-time type -> writer
+static bool IsLTTBSupportedType(...);                  // type validation
 ```
 
-类型分发在 bind 时解析为裸函数指针（trivially copyable，无状态捕获），存储在 FunctionData 中。Update/Finalize 每行直接调用函数指针，避免循环内的 20-case switch 分发。
+Type dispatch is resolved at bind time into raw function pointers. These pointers are trivially copyable and capture no state, so they can be stored safely in `FunctionData`. Update and Finalize call the selected pointer directly for each row, avoiding repeated 20-case type switches inside execution loops.
 
-### 3.3 LTTB 算法核心
+### 3.3 LTTB Core
 
 ```cpp
-// 降采样核心逻辑（≤80 行，委托给以下助手函数）
 static std::vector<LTTBPoint> Downsample(...);
-static std::pair<double,double> NextBucketAverage(...);  // 下一桶 (x,y) 均值，空桶回退末点
-static idx_t SelectMaxAreaPoint(...);                    // 桶内选最大三角形面积点
-static LTTBBucketBounds ComputeLTTBBounds(...);         // 等计数分桶的索引边界
-// MinMax 预选逻辑由 MinMaxLTTBDownsample 编排（见 §4.7）
+static std::pair<double, double> NextBucketAverage(...);
+static idx_t SelectMaxAreaPoint(...);
+static LTTBBucketBounds ComputeLTTBBounds(...);
 ```
 
-### 3.4 聚合生命周期函数
+`Downsample` contains the main LTTB orchestration and delegates the per-bucket details to helpers so functions stay under the local 80-line guideline. MinMax preselection is orchestrated by `MinMaxLTTBDownsample`.
+
+### 3.4 Aggregate Lifecycle Functions
 
 ```cpp
-static void LTTBInitialize(...);          // 状态初始化
-static void LTTBUpdate(...);              // 逐行更新状态（lttb/lttb_sorted/lttb_indices）
-static void MinMaxLTTBUpdate(...);        // 逐行更新状态（minmax_lttb，4 参数）
-static void BucketStatsUpdate(...);       // 逐行更新状态（bucket_stats）
-static void LTTBCombine(...);             // 合并部分状态（所有函数共享）
-static void LTTBFinalize(...);            // 最终化：执行降采样并写入结果
-static void LTTBIndicesFinalize(...);     // 最终化：写入索引结果
-static void MinMaxLTTBFinalize(...);      // 最终化：委托 MinMaxLTTBDownsample 并写入结果
-static void BucketStatsFinalize(...);     // 最终化：委托 ComputeBucketStats 并写入结果
-static void LTTBDestroy(...);             // 释放状态内存（所有函数共享）
+static void LTTBInitialize(...);
+static void LTTBUpdate(...);
+static void MinMaxLTTBUpdate(...);
+static void BucketStatsUpdate(...);
+static void LTTBCombine(...);
+static void LTTBFinalize(...);
+static void LTTBIndicesFinalize(...);
+static void MinMaxLTTBFinalize(...);
+static void BucketStatsFinalize(...);
+static void LTTBDestroy(...);
 ```
 
-### 3.5 函数注册与绑定
+All aggregate functions share `LTTBState`; only Update and Finalize vary by function family.
+
+### 3.5 Binding and Registration
 
 ```cpp
-static LogicalType LTTBReturnType(...);                        // 构造返回类型
-static LogicalType BucketStatsReturnType(...);                 // bucket_stats 返回类型
-static AggregateFunction GetLTTBConcreteFunction(...);         // lttb 具体函数
-static AggregateFunction GetLTTBIndicesConcreteFunction(...);  // lttb_indices 具体函数
-static AggregateFunction GetMinMaxLTTBConcreteFunction(...);   // minmax_lttb 具体函数
-static AggregateFunction GetBucketStatsConcreteFunction(...);  // bucket_stats 具体函数
-static unique_ptr<FunctionData> LTTBBindFunctionImpl(...);     // lttb 统一绑定逻辑
-static unique_ptr<FunctionData> MinMaxLTTBBindFunction(...);   // minmax_lttb 绑定
-static unique_ptr<FunctionData> BucketStatsBindFunction(...);  // bucket_stats 绑定
-static void LoadInternal(...);                                 // 注册所有函数
+static LogicalType LTTBReturnType(...);
+static LogicalType BucketStatsReturnType(...);
+static AggregateFunction GetLTTBConcreteFunction(...);
+static AggregateFunction GetLTTBIndicesConcreteFunction(...);
+static AggregateFunction GetMinMaxLTTBConcreteFunction(...);
+static AggregateFunction GetBucketStatsConcreteFunction(...);
+static unique_ptr<FunctionData> LTTBBindFunctionImpl(...);
+static unique_ptr<FunctionData> MinMaxLTTBBindFunction(...);
+static unique_ptr<FunctionData> BucketStatsBindFunction(...);
+static void LoadInternal(...);
 ```
 
-### 3.6 扩展入口
+The public function names are registered with placeholder `ANY` argument types. Their bind callbacks validate actual types, build a concrete aggregate function with the resolved types, and return function-specific `FunctionData`.
+
+### 3.6 Extension Entry Point
 
 ```cpp
 void LttbExtension::Load(...) { LoadInternal(loader); }
 DUCKDB_CPP_EXTENSION_ENTRY(lttb, loader) { ... }
 ```
 
-### 为什么用单文件实现
+### Why a Single File
 
-LTTB 扩展的全部逻辑约 1480 行，拆分为多个文件会引入不必要的头文件依赖和编译复杂度。单文件结构使得：
-- 阅读者可以在一个文件中理解完整的执行流程（从 SQL 调用到结果输出）。
-- 所有内部函数都在匿名命名空间中，无符号导出，编译器可以更好地内联优化。
-- 编译依赖最小化——只需包含 DuckDB 的类型头和聚合函数头。
+The extension is small enough that splitting it into multiple translation units would add header dependencies and compile complexity without much benefit. The single-file structure has practical advantages:
+
+- Readers can follow the full SQL-to-result path in one file.
+- Internal helpers live in an anonymous namespace with no exported symbols.
+- The compiler has good visibility for inlining.
+- Build dependencies stay minimal.
 
 ---
 
-## 4. 核心实现详解
+## 4. Core Implementation Details
 
-### 4.1 类型保持 I/O：MakeReader / MakeWriter
+### 4.1 Type-Preserving I/O: MakeReader / MakeWriter
 
-这是本扩展最核心的设计决策。LTTB 算法本身只关心 `double` 值的排序和三角形面积计算，但用户需要传入 `DATE`、`TIMESTAMP`、`DECIMAL` 等类型，并期望输出保持这些类型。
+The LTTB algorithm only needs `double` values for sorting and triangle-area computation, but users can pass `DATE`, `TIMESTAMP`, `DECIMAL`, and integer types, and expect the output to preserve those types.
 
-**解决方案**：在 I/O 边界做类型转换，算法内部始终操作 `double`。
+The solution is to convert at the boundary:
 
+```text
+User input (DATE/TIMESTAMP/DECIMAL/...)
+        |
+        v  x_read() / y_read(), resolved by MakeReader at bind time
+  double x, y  --->  LTTB algorithm (sort + bucket + select)
+        |
+        v  x_write() / y_write(), resolved by MakeWriter at bind time
+User output (DATE/TIMESTAMP/DECIMAL/...)
 ```
-用户输入 (DATE/TIMESTAMP/DECIMAL/...)
-        │
-        ▼  x_read() / y_read()  ← bind 时由 MakeReader 解析的函数指针
-  double x, y  ──────►  LTTB 算法 (排序 + 分桶 + 选点)
-        │
-        ▼  x_write() / y_write()  ← bind 时由 MakeWriter 解析的函数指针
-用户输出 (DATE/TIMESTAMP/DECIMAL/...)
-```
 
-**MakeReader** / **MakeWriter** 在 bind 时通过 `switch (type.id())` 解析类型，返回类型特定的裸函数指针（lambda 转换而来，trivially copyable，无状态捕获）。这些指针存储在 FunctionData 中，Update/Finalize 每行直接调用，避免了循环内的 20-case switch 分发。
+`MakeReader` and `MakeWriter` switch on `type.id()` during binding and return type-specific raw function pointers, implemented as stateless lambdas converted to function pointers. The pointers are stored in `FunctionData` and called directly during execution.
 
-| 类型 | 物理存储 | 转换方式 |
+| Type | Physical Storage | Conversion |
 |---|---|---|
-| `DATE` | `date_t` (int32 天数) | `Date::EpochDays()` → 天数 double |
-| `TIMESTAMP` / `TIMESTAMP_TZ` | `timestamp_t` (int64 微秒) | `Timestamp::GetEpochMicroSeconds()` → 微秒 double |
-| `TIMESTAMP_S` | `timestamp_sec_t` (int64 秒) | 直接读 `.value` → 秒 double |
-| `TIMESTAMP_MS` | `timestamp_ms_t` (int64 毫秒) | 直接读 `.value` → 毫秒 double |
-| `TIMESTAMP_NS` | `timestamp_ns_t` (int64 纳秒) | 直接读 `.value` → 纳秒 double |
-| `DECIMAL` | int16/int32/int64/hugeint_t | 读原始整数 ÷ POW10[scale] |
-| 整数类型 | 对应宽度整数 | `static_cast<double>` |
-| `HUGEINT` / `UHUGEINT` | 128 位整数 | `Hugeint::TryCast` / `Uhugeint::TryCast`（检查返回值） |
+| `DATE` | `date_t`, int32 days | `Date::EpochDays()` to double days |
+| `TIMESTAMP` / `TIMESTAMP_TZ` | `timestamp_t`, int64 microseconds | `Timestamp::GetEpochMicroSeconds()` to double microseconds |
+| `TIMESTAMP_S` | `timestamp_sec_t`, int64 seconds | Read `.value` directly |
+| `TIMESTAMP_MS` | `timestamp_ms_t`, int64 milliseconds | Read `.value` directly |
+| `TIMESTAMP_NS` | `timestamp_ns_t`, int64 nanoseconds | Read `.value` directly |
+| `DECIMAL` | int16/int32/int64/hugeint_t | Raw integer divided by `POW10[scale]` |
+| Integer types | Corresponding integer width | `static_cast<double>` |
+| `HUGEINT` / `UHUGEINT` | 128-bit integer | `Hugeint::TryCast` / `Uhugeint::TryCast`, checked |
 
-**WriteFromDouble** 的逆操作由 `MakeWriter` 返回的函数指针执行。DECIMAL 写回时使用 `std::llround(value * POW10[scale])` 做四舍五入，并通过 `MaxValue`/`MinValue` clamp 到物理整数范围，防止 ULP 抖动导致的越界窄化。
+`WriteFromDouble` is handled by the function pointer returned from `MakeWriter`. DECIMAL output uses `std::llround(value * POW10[scale])` and clamps to the physical integer range with `MaxValue` / `MinValue`, preventing out-of-range narrowing caused by tiny ULP differences.
 
-**为什么用 bind 时函数指针而不是模板**：DuckDB 的 `first`/`last` 等聚合函数使用模板为每种类型生成独立的函数实例，因为它们的状态需要存储类型化值。但 LTTB 的状态始终是 `double`，不需要为每种类型生成独立的 Update/Combine/Finalize 函数。bind 时解析函数指针避免了模板膨胀（20+ 类型 × 2 = 40+ 实例化），且类型分发只在 bind 时执行一次，循环内是单次间接调用（现代 CPU 的分支预测器能很好地处理）。
+Bind-time function pointers are used instead of templates because the aggregate state always stores `double`, unlike DuckDB aggregates such as `first` or `last` whose state stores typed values. This avoids template expansion across 20+ logical types while keeping type dispatch out of the execution loop.
 
-**单调性保证**：所有支持的类型到 `double` 的转换都是单调的——即 `a < b` 在原始类型中成立，当且仅当转换后的 `double` 值保持同样的序关系。这保证了在 `double` 上排序的结果与在原始类型上排序的结果一致。代码中在排序处添加了注释说明这一不变量。
+All supported conversions are monotonic: if `a < b` in the source type, then the converted double values keep the same order. This guarantees sorting on double is consistent with sorting on the original logical type.
 
-### 4.2 LTTB 算法：Downsample
+### 4.2 LTTB Algorithm: Downsample
 
-`Downsample` 实现了 LTTB 降采样的核心逻辑，与 ClickHouse PR #57003 修复后的行为一致。为遵守"函数 < 80 行"的代码规范，主循环的三个子步骤被提取为独立助手函数，`Downsample` 本身仅做边界判定与编排：
+`Downsample` implements the LTTB core and follows the behavior of ClickHouse after PR #57003.
 
-**算法步骤**：
+Algorithm steps:
 
-1. **排序**（可跳过）：`stable_sort` 按 `x` 升序排列（比较器为共享的 `LessByX`，见 §4.3）。使用稳定排序保证相同 `x` 值的点保持插入顺序。
-2. **边界情况**：
-   - `buckets == 0` → 返回空
-   - `n <= buckets` → 返回全部排序后的点
-   - `buckets == 1` → 返回第一个点
-   - `buckets == 2` → 返回第一个和最后一个点
-3. **分桶采样**（`buckets >= 3`），每个桶的迭代委托给三个助手：
-   - `ComputeLTTBBounds(bucket, n, width)`：按等计数公式计算当前桶与下一桶的半开索引边界 `[floor(k·width)+1, floor((k+1)·width)+1)`，并 clamp 到 `[1, n-1]` / `[1, n]`。
-   - `NextBucketAverage(points, next_start, next_end)`：下一桶的 (x, y) 均值；空桶时回退到最后一点（见下方"空桶保护"）。
-   - `SelectMaxAreaPoint(points, previous, start, end, avg_x, avg_y)`：在当前桶候选点中选使三角形面积最大者。三角形由 **前一个选中点**、**当前候选点**、**下一桶平均点** 构成，面积公式：`|（前.x - 均值.x) * (候选.y - 前.y) - (前.x - 候选.x) * (均值.y - 前.y)|`。
+1. **Sort**, unless skipped: `stable_sort` by `x` ascending using the shared `LessByX` comparator. Stable sorting keeps equal-`x` points in insertion order.
+2. **Handle boundary cases**:
+   - `buckets == 0`: return an empty result.
+   - `n <= buckets`: return all sorted points.
+   - `buckets == 1`: return the first point.
+   - `buckets == 2`: return the first and last points.
+3. **Sample buckets**, for `buckets >= 3`:
+   - `ComputeLTTBBounds(bucket, n, width)` computes half-open current and next bucket index ranges with the equal-count formula `[floor(k * width) + 1, floor((k + 1) * width) + 1)`, clamped to valid ranges.
+   - `NextBucketAverage(points, next_start, next_end)` computes the next bucket average `(x, y)` and falls back to the last point for an empty next bucket.
+   - `SelectMaxAreaPoint(points, previous, start, end, avg_x, avg_y)` chooses the candidate with maximum triangle area. The triangle is formed from the previous selected point, the current candidate, and the next bucket average.
 
-**空桶保护**：当下一个桶为空时（`next_end <= next_start`），使用最后一个点作为平均值。这是 DuckDB 实现相对于 ClickHouse 的一个防御性改进——ClickHouse 源码中没有这个保护，理论上会除以零（PR #57003 的分桶策略在实践中避免了这种情况，但源码层面缺少显式保护）。
+The triangle area expression is:
 
-**可选参数**：
-- `skip_sort`：`lttb_sorted` 传入 `true`，跳过排序步骤。
-- `out_indices`：`lttb_indices` 传入非空指针，函数会填充选中点在排序后数组中的 0-based 位置索引。
+```text
+abs((previous.x - avg_x) * (candidate.y - previous.y) -
+    (previous.x - candidate.x) * (avg_y - previous.y))
+```
 
-**为什么 Downsample 会修改输入**：当 `n <= buckets` 时，函数通过 `std::move(points)` 直接转移向量所有权，避免拷贝。这是安全的，因为 `LTTBFinalize` 是状态向量的终端消费者——调用后状态即被销毁。代码注释明确说明了这一约定。
+The empty-bucket fallback is a defensive improvement over ClickHouse's source-level implementation, which lacks an explicit division-by-zero guard even though the current bucket strategy normally avoids it.
 
-### 4.3 聚合状态管理
+Optional behavior:
 
-DuckDB 聚合函数遵循 **Initialize → Update → [Combine] → Finalize → Destroy** 的生命周期：
+- `skip_sort`: `lttb_sorted` passes `true`.
+- `out_indices`: `lttb_indices` passes a non-null pointer and receives selected 0-based positions in sorted order.
 
-**LTTBState**：
+`Downsample` may move from the input vector when `n <= buckets`, because Finalize is the terminal consumer of the aggregate state's vector.
+
+### 4.3 Aggregate State Management
+
+DuckDB aggregate functions follow this lifecycle:
+
+```text
+Initialize -> Update -> [Combine] -> Finalize -> Destroy
+```
+
+`LTTBState` stores the data needed by every aggregate function:
+
 ```cpp
 struct LTTBState {
-    std::vector<LTTBPoint> *points = nullptr;  // 堆分配的点向量
-    uint64_t buckets = 0;                       // 请求的桶数
-    bool has_buckets = false;                   // 是否已设置桶数
+    std::vector<LTTBPoint> *points = nullptr;
+    uint64_t buckets = 0;
+    bool has_buckets = false;
 };
 ```
 
-**为什么用裸指针 `new`/`delete` 而不是 `unique_ptr`**：DuckDB 聚合状态通过 `memcpy` 复制（状态大小由 `LTTBStateSize` 返回），`unique_ptr` 不可平凡复制。DuckDB 自身的聚合函数（如 `first`/`last`）也使用 `new char[]` + Destroy 清理的模式。Arena 集成曾作为 TODO 项评估，但 `std::vector` 与 Arena 的集成非平凡，且当前模式在 Destroy 中正确释放，因此推迟。
+A raw pointer is used because DuckDB aggregate states are copied as plain memory according to `LTTBStateSize`; `unique_ptr` is not trivially copyable. DuckDB's own aggregate implementations use similar explicit allocation and Destroy cleanup patterns. Arena integration was evaluated and deferred because `std::vector` does not integrate trivially with DuckDB's `ArenaAllocator`, and the current Destroy path releases memory correctly.
 
-**LTTBUpdate**：
-- 通过 `UnifiedVectorFormat` 统一处理不同向量格式（FLAT、CONSTANT、DICTIONARY 等）。
-- 逐行检查有效性（NULL 跳过）、桶数合法性（非负、组内恒定）。
-- 桶数恒定性校验与点累积分别委托给共享助手 `SetBucketCount` 与 `PushPoint`（见下方"共享助手"），消除三个 Update 函数间的重复逻辑。
-- 调用 `ReadAsDouble` 将类型化输入转为 `double`。
-- `IsValidPoint` 检查 NaN（跳过 NaN 行，与 ClickHouse 一致）。
-- 首次创建向量时 `reserve(kInitialPointReserve)`（常量 = 256），避免早期几何增长（0→1→2→4→...→256）的多次重分配。
-- 硬性上限 `MAX_LTTB_POINTS = 1ULL << 30`（与 ClickHouse 的 `MAX_ARRAY_SIZE` 一致）。
+`LTTBUpdate`:
 
-**共享助手**（`LTTBUpdate` / `MinMaxLTTBUpdate` / `BucketStatsUpdate` 共用）：
-- `PushPoint(state, x, y, func_name)`：首次按需分配点向量并 `reserve(kInitialPointReserve)`，累积有效点，超 `MAX_LTTB_POINTS` 时抛异常。错误消息携带调用方函数名以便定位。
-- `SetBucketCount(state, buckets, func_name)`：记录组内桶数，组内不一致时抛异常。`minmax_lttb` 因需在 `buckets` 字段位打包 `n_out` + `ratio`，保留自己的内联逻辑。
-- `LessByX(lhs, rhs)`：按 `x` 的严格弱序比较，被 `Downsample`、MinMax 预选候选集排序、`bucket_stats` 排序三处共享，避免比较器在各调用点漂移。
+- Uses `UnifiedVectorFormat` to handle FLAT, CONSTANT, DICTIONARY, and other vector formats uniformly.
+- Skips NULL rows through validity masks.
+- Validates bucket count: non-negative and constant within each group.
+- Converts typed input to double through the bind-time reader function pointers.
+- Skips NaN points, matching ClickHouse.
+- Allocates the point vector lazily and reserves `kInitialPointReserve = 256` on first use.
+- Enforces `MAX_LTTB_POINTS = 1ULL << 30`, matching ClickHouse's broad guard.
 
-**LTTBCombine**——并行执行时合并部分状态：
-- **指针转移优化**：当目标状态没有点时，直接转移源向量的指针（O(1)），并将源指针置空防止 Destroy 双重释放。
-- **reserve + insert**：当目标已有数据时，先 `reserve(target.size + source.size)` 再 `insert`，避免每次合并触发几何重分配。
-- 合并策略是简单拼接——排序在 Finalize 时统一进行，不需要有序合并。
+Shared helpers used by `LTTBUpdate`, `MinMaxLTTBUpdate`, and `BucketStatsUpdate`:
 
-**LTTBFinalize**：
-- 从 `bind_data` 读取 `sorted` 标志（`lttb_sorted` 传入 `true`）。
-- 对每个状态调用 `Downsample`。
-- 通过 `WriteFromDouble` 将 `double` 结果转回类型化输出。
-- 使用 `ListVector::Reserve` 管理输出向量容量。
+- `PushPoint(state, x, y, func_name)`: allocates the vector if needed, appends a valid point, and checks the maximum point count.
+- `SetBucketCount(state, buckets, func_name)`: records and validates a constant per-group bucket count.
+- `LessByX(lhs, rhs)`: shared comparator for `Downsample`, MinMax candidate sorting, and `bucket_stats`.
 
-**LTTBIndicesFinalize**：
-- 与 `LTTBFinalize` 类似，但调用 `Downsample` 时传入 `out_indices` 指针。
-- 输出 `BIGINT[]` 而非 `STRUCT(x, y)[]`。
+`LTTBCombine` merges partial aggregate states during parallel execution:
 
-**LTTBDestroy**：`delete state.points`，释放堆内存。
+- If the target state has no points, it transfers the source vector pointer in O(1) and nulls the source pointer to avoid double free.
+- If the target already has data, it reserves `target.size + source.size` before inserting, avoiding repeated geometric reallocations.
+- States are concatenated; sorting happens once in Finalize.
 
-### 4.4 Bind 函数与多态分发
+`LTTBFinalize` reads the `sorted` flag from bind data, calls `Downsample`, converts the selected points back to typed output, and writes a DuckDB list result using `ListVector::Reserve`.
 
-DuckDB 的聚合函数绑定机制允许在查询编译时根据输入参数类型动态选择具体实现。
+`LTTBIndicesFinalize` follows the same path but writes `BIGINT[]` indices instead of `STRUCT(x, y)[]`.
 
-**两阶段注册**：
+`LTTBDestroy` deletes the heap-allocated vector.
 
-1. **占位函数**（`GetLTTBFunction` 等）：注册时使用 `LogicalType::ANY` 作为 x/y 参数类型和返回类型，绑定回调设为 `LTTBBindFunction` 等。DuckDB 在查询绑定时调用这个回调。
+### 4.4 Bind Functions and Polymorphic Dispatch
 
-2. **具体函数**（`GetLTTBConcreteFunction` 等）：绑定回调内部根据实际输入类型构造具体函数，设置正确的参数类型和返回类型。
+DuckDB binding lets an aggregate choose a concrete implementation after the query's input types are known.
 
-**LTTBBindFunctionImpl** 是统一的绑定逻辑：
-- 校验所有参数类型已解析（`UNKNOWN` 抛 `ParameterNotResolvedException`）。
-- 读取 x/y 的实际类型，SQLNULL 强制转为 DOUBLE（向后兼容无类型 NULL 字面量）。
-- 校验类型在支持集合内，否则抛出清晰的错误信息。
-- 根据 `sorted` 和 `indices` 标志选择对应的具体函数。
-- 返回 `LTTBFunctionData(sorted)` 作为绑定数据，供 Finalize 读取。
+Registration uses two stages:
 
-**三个绑定变体**：
-- `LTTBBindFunction`：`sorted=false, indices=false`（标准 `lttb`）
-- `LTTBSortedBindFunction`：`sorted=true, indices=false`（`lttb_sorted`）
-- `LTTBIndicesBindFunction`：`sorted=false, indices=true`（`lttb_indices`）
+1. Placeholder functions use `LogicalType::ANY` for x/y argument types and attach a bind callback.
+2. The bind callback validates actual types, builds the concrete aggregate function with the resolved argument and return types, and returns `FunctionData`.
 
-**为什么用单个绑定实现 + 标志位而不是三个独立实现**：三个变体共享 95% 的逻辑（类型校验、具体函数构造），只在 `sorted` 和 `indices` 两个布尔标志上有差异。提取为 `LTTBBindFunctionImpl` 避免了代码重复，且标志位的语义清晰。
+`LTTBBindFunctionImpl` is the shared binder for the `lttb` family:
 
-### 4.5 FunctionData 与函数指针
+- Rejects unresolved parameter types with `ParameterNotResolvedException`.
+- Reads actual `x` and `y` types and coerces untyped `SQLNULL` to `DOUBLE` for backward compatibility.
+- Validates both types against the supported set.
+- Chooses the concrete function based on `sorted` and `indices` flags.
+- Returns `LTTBFunctionData` for Finalize.
+
+The three variants are:
+
+- `LTTBBindFunction`: `sorted=false`, `indices=false`.
+- `LTTBSortedBindFunction`: `sorted=true`, `indices=false`.
+- `LTTBIndicesBindFunction`: `sorted=false`, `indices=true`.
+
+One shared implementation is used because the variants differ only in these flags; type validation and concrete-function construction are otherwise identical.
+
+### 4.5 FunctionData and Function Pointers
 
 ```cpp
 struct LTTBFunctionData : public FunctionData {
     bool sorted;
-    ReadFunc x_read, y_read;    // bind 时解析的类型读函数指针
-    WriteFunc x_write, y_write; // bind 时解析的类型写函数指针
+    ReadFunc x_read, y_read;
+    WriteFunc x_write, y_write;
     unique_ptr<FunctionData> Copy() const override;
     bool Equals(const FunctionData &other_p) const override;
 };
 ```
 
-`FunctionData` 是 DuckDB 的绑定数据基类，用于在绑定阶段携带信息到执行阶段。`Copy()` 和 `Equals()` 是 DuckDB 要求的虚函数，用于查询计划缓存和等价性检查。
+`FunctionData` carries bind-time information into execution. `Copy()` and `Equals()` are required by DuckDB for plan caching and equivalence checks.
 
-**函数指针是裸指针**（trivially copyable，无状态捕获），所以 `Copy()` 的默认成员拷贝是正确的。代码注释明确标注：不要替换为 `std::function` 或有状态 lambda，否则会破坏 Copy 语义。
+The read/write function pointers are raw, trivially copyable pointers. A plain member copy is therefore correct. They should not be replaced with `std::function` or stateful lambdas without revisiting Copy semantics.
 
-`sorted` 标志在 Finalize 中被读取，决定是否跳过排序。`x_read`/`y_read`/`x_write`/`y_write` 在 Update/Finalize 中被直接调用，避免循环内的类型 switch 分发。
+FunctionData variants:
 
-**三个 FunctionData 变体**：
-- `LTTBFunctionData`：`lttb`/`lttb_sorted`/`lttb_indices` 共用，携带 `sorted` 标志 + 4 个函数指针。
-- `MinMaxLTTBFunctionData`：`minmax_lttb` 专用，额外携带 `minmax_ratio` 默认值。
-- `BucketStatsFunctionData`：`bucket_stats` 专用，携带 4 个函数指针（无 `sorted` 标志，bucket_stats 总是排序）。
+- `LTTBFunctionData`: shared by `lttb`, `lttb_sorted`, and `lttb_indices`; carries the `sorted` flag and four function pointers.
+- `MinMaxLTTBFunctionData`: used by `minmax_lttb`; also carries the default `minmax_ratio`.
+- `BucketStatsFunctionData`: used by `bucket_stats`; carries four function pointers and no sorted flag because `bucket_stats` always sorts.
 
 ### 4.6 minmax_lttb / minmax_lttb_sorted
 
-`minmax_lttb(x, y, n, minmax_ratio)` 是两阶段近似降采样：先用 MinMax 预选缩减候选集，再对候选集跑标准 LTTB。`minmax_ratio` 默认 4（匹配 plotly-resampler `MinMaxLTTB` 默认值），可通过第 4 参数覆盖（传 NULL 用默认值）。`minmax_lttb_sorted` 是其排序输入快速路径。
+`minmax_lttb(x, y, n, minmax_ratio)` is a two-stage approximate downsampling function: it first preselects candidates through MinMax, then runs standard LTTB on the candidate set. `minmax_ratio` defaults to 4, matching plotly-resampler's `MinMaxLTTB` default, and can be overridden by the fourth argument. Passing NULL uses the default.
 
-**状态编码**：`MinMaxLTTBUpdate` 需要在 `LTTBState`（仅有一个 `uint64_t buckets` 字段）中同时存储 `n_out` 和 `minmax_ratio`。采用位打包——低 32 位存 `n_out`，高 32 位存 `minmax_ratio`（ratio ≤ 2³¹）。Update 时校验组内 `n_out` 与 `minmax_ratio` 恒定，否则抛异常。
+`minmax_lttb_sorted` is the sorted-input variant.
 
-**退化分支**（在 `MinMaxLTTBFinalize` 中，bin-first 之前）：
-- `n_out == 0` → 空输出
-- `n <= n_out` → 全部点（经 `Downsample`，处理排序）
-- `minmax_ratio <= 1` 或 `n / ratio <= n_out` → 预选无收益，直接标准 LTTB
+State encoding packs both `n_out` and `minmax_ratio` into `LTTBState::buckets`, which is a single `uint64_t`:
 
-### 4.7 Bin-first MinMax 预选优化
+- Low 32 bits: `n_out`.
+- High 32 bits: `minmax_ratio`, with ratio constrained to fit.
 
-`MinMaxLTTBFinalize` 是轻量编排器（≤40 行）：逐组从 `state.buckets` 解包 `n_out` 与 `minmax_ratio`，委托 `MinMaxLTTBDownsample` 完成降采样，再写入类型化结果。算法核心集中在 `MinMaxLTTBDownsample` 及其助手函数中，采用 **bin-first** 预选，跳过对全部 n 个点的完整排序。
+`MinMaxLTTBUpdate` validates that both values are constant within a group.
 
-**旧方案**（已移除）：`stable_sort` 全部 n 个点（O(n log n)）→ 扫描排序后点集做每桶 argmin/argmax（O(n)）→ 对候选集跑 LTTB。完整排序主导了运行时（在打乱的 1M 输入上约占 88%：59ms 排序 vs 67ms 总计），而 O(n) 预选扫描只是用一个 O(n) pass 换另一个，相对普通 `lttb` 仅约 1.0x 加速。
+Degenerate paths in `MinMaxLTTBFinalize`:
 
-**新方案**（bin-first）跳过完整排序，由 `MinMaxLTTBDownsample` 编排四个助手：
+- `n_out == 0`: empty output.
+- `n <= n_out`: all points, through `Downsample` so sorting behavior is consistent.
+- `minmax_ratio <= 1` or `n / ratio <= n_out`: no useful preselection, so use standard LTTB.
 
-1. **Step 1**（O(n)）：`FindXRangeEndpoints` 一次遍历找 `x_min`/`x_max` 及对应的首/末点索引 `first_idx`/`last_idx`。
-2. **Step 2**（O(n)）：`BuildMinMaxBins` 将所有内部点（排除首/末）按等宽 x 区间分入 `n_minmax_buckets = n_out * ratio / 2` 个 `MinMaxBin`，每桶保留 `argmin(y)` 与 `argmax(y)`。用预计算的 `inv_bin_width`（乘法代替除法）提升吞吐。
-3. **Step 3**：`CollectMinMaxCandidates` 构造候选集 = 首点 + 每桶 argmin/argmax + 末点。桶内 ≤2 点时全保留；否则按 x 序压入 min/max 以保证后续排序稳定。
-4. **Step 4**（O(k log k)）：仅对候选集（k ≈ n_out·ratio，典型约 4000）用共享的 `LessByX` 排序，然后跑 LTTB（`skip_sort=true`）。
+### 4.7 Bin-First MinMax Preselection
 
-**复杂度**：O(n) + O(k log k)，其中 k = n_out·ratio/2，对比旧方案的 O(n log n) + O(n)。
+`MinMaxLTTBFinalize` is a small orchestrator: for each group it unpacks `n_out` and `minmax_ratio`, calls `MinMaxLTTBDownsample`, and writes typed results.
 
-**基准**（1M 点 / n=1000）：
-- 打乱输入：75ms → 10ms（7.5x）
-- 已排序输入：17ms → 11ms（1.5x，受限于未改变的 O(n) Update 累积）
+The core algorithm uses **bin-first** preselection and avoids sorting all `n` points.
 
-**边界修复**：当所有点 x 相等时，`first_idx == last_idx`，直接压入末点会重复端点。代码以 `if (last_idx != first_idx)` 守卫，避免候选集中端点重复（否则 Downsample 会让首末同为同一点，丢失真实末点）。
+The removed old approach was:
 
-**内存**：仍为 O(n)——所有点在 Update 中累积（DuckDB 聚合模型）。候选集是临时的，在本次 Finalize 调用内构建并丢弃。降至 O(n_out·ratio) 需要流式状态设计（见 `TODO.md` "True low-memory MinMax state"）。
+```text
+stable_sort all n points -> scan sorted points for per-bucket argmin/argmax -> run LTTB on candidates
+```
+
+That full sort dominated runtime. On shuffled 1M input it was about 88% of total time, around 59 ms of 67 ms.
+
+The current bin-first approach:
+
+1. **Step 1, O(n)**: `FindXRangeEndpoints` scans once to find `x_min`, `x_max`, and the corresponding first and last endpoint indices.
+2. **Step 2, O(n)**: `BuildMinMaxBins` assigns all interior points to equal-width x-bins, excluding the endpoints. Each `MinMaxBin` keeps `argmin(y)` and `argmax(y)`. A precomputed `inv_bin_width` replaces division with multiplication.
+3. **Step 3**: `CollectMinMaxCandidates` builds the candidate set: first point, each bin's min/max points, then last point. Bins with two or fewer points keep all points; otherwise min/max are appended in x order for stable follow-up sorting.
+4. **Step 4, O(k log k)**: only candidates are sorted with `LessByX`, then LTTB runs with `skip_sort=true`. Typically `k` is about `n_out * ratio`, for example around 4000.
+
+Complexity is O(n) + O(k log k), where `k ~= n_out * ratio / 2`, instead of the old O(n log n) + O(n).
+
+Benchmarks on 1M points / n=1000:
+
+- Shuffled input: 75 ms -> 10 ms, 7.5x.
+- Sorted input: 17 ms -> 11 ms, 1.5x, limited by the unchanged O(n) Update accumulation.
+
+Edge-case fix: when all x values are equal, `first_idx == last_idx`. Pushing the last endpoint unconditionally would duplicate the endpoint and cause `Downsample` to treat the first and last point as the same point. The code guards with `if (last_idx != first_idx)`.
+
+Memory remains O(n) because DuckDB's aggregate state accumulates all points during Update. The candidate set is temporary and is discarded after the current Finalize call. Reducing state memory to O(n_out * ratio) would require a streaming state design; see `TODO.md`, "True low-memory MinMax state".
 
 ### 4.8 bucket_stats
 
-`bucket_stats(x, y, num_buckets)` 返回每桶的 y 分布统计：`STRUCT(bucket_start, bucket_end, count, min, max, mean, std, first, last)[]`。
+`bucket_stats(x, y, num_buckets)` returns per-bucket y distribution statistics:
 
-`BucketStatsFinalize` 是轻量编排器（≤80 行），三个分支分别处理退化与一般情况，统计计算与结果写入委托给助手函数：
+```text
+STRUCT(bucket_start, bucket_end, count, min, max, mean, std, first, last)[]
+```
 
-- **分桶**：等计数按索引分桶（与 LTTB 同公式），由 `ComputeBucketBounds` 计算每桶半开索引边界。首末点为单例边界桶，内部按宽度 `(n-2)/(num_buckets-2)` 划分。
-- **统计**：`ComputeBucketStats(points, start, end)` 单次线性扫描计算 count/min/max/mean/std/first/last。仅对 y 计算。`min`/`max`/`first`/`last` 保持 `y_type`；`mean`/`std` 为 DOUBLE。标准差用**总体标准差**（除以 N，非 N-1），用 `sum_sq/N - mean²` 计算并 `max(0, ...)` 防止浮点负方差。
-- **写入**：`WriteBucketStatsRow(sink, offset, row)` 将一个 `BucketStatsRow` 写入结果子向量；`BucketStatsSink` 聚合 9 个子向量引用与类型化写函数指针，保持写入器签名精简。
-- **退化**：`num_buckets == 0` → 空条目；`n <= num_buckets` → 每点一桶（count=1, std=0）；`num_buckets == 1` → 全部点单桶。
-- **排序**：`bucket_stats` 无 sorted 变体，总是在 Finalize 中用共享的 `LessByX` 做 `stable_sort`。
+`BucketStatsFinalize` handles degenerate branches and delegates statistics and result writing to helpers:
+
+- **Bucketing**: equal-count index buckets use the same formula as LTTB. `ComputeBucketBounds` computes half-open ranges. The first and last points are singleton boundary buckets; interior points are split with width `(n - 2) / (num_buckets - 2)`.
+- **Statistics**: `ComputeBucketStats(points, start, end)` scans once to compute count/min/max/mean/std/first/last for y. `min`, `max`, `first`, and `last` preserve `y_type`; `mean` and `std` are DOUBLE. Standard deviation is population standard deviation, dividing by N rather than N-1, and uses `sum_sq / N - mean^2` with `max(0, ...)` to guard against tiny negative floating-point variance.
+- **Writing**: `WriteBucketStatsRow(sink, offset, row)` writes a `BucketStatsRow` into the result child vectors. `BucketStatsSink` holds references to the nine child vectors plus typed write pointers.
+- **Degenerate cases**: `num_buckets == 0` returns an empty list; `n <= num_buckets` returns one bucket per point with count=1 and std=0; `num_buckets == 1` returns one bucket for all points.
+- **Sorting**: there is no sorted variant for `bucket_stats`; it always uses shared `LessByX` and `stable_sort` in Finalize.
 
 ---
 
-## 5. 实现中遇到的问题及解决方案
+## 5. Implementation Issues and Fixes
 
-### 5.1 TIMESTAMP_SEC / TIMESTAMP_MS epoch 转换 Bug（严重）
+### 5.1 TIMESTAMP_SEC / TIMESTAMP_MS Epoch Conversion Bug
 
-**问题**：最初实现中，`TIMESTAMP_SEC` 和 `TIMESTAMP_MS` 使用了 `Timestamp::GetEpochSeconds()` 和 `Timestamp::GetEpochMs()` 来转换。但这两个函数假设输入是**微秒**单位的 `timestamp_t`，会分别除以 1,000,000 和 1,000。而 `timestamp_sec_t` 和 `timestamp_ms_t` 的 `.value` 字段**已经直接存储秒和毫秒**，不需要再除。
+The initial implementation used `Timestamp::GetEpochSeconds()` and `Timestamp::GetEpochMs()` to convert `TIMESTAMP_SEC` and `TIMESTAMP_MS`. Those helpers assume a microsecond-based `timestamp_t` input and divide by 1,000,000 or 1,000. However, `timestamp_sec_t` and `timestamp_ms_t` already store seconds and milliseconds directly in their `.value` field.
 
-**后果**：输入 `TIMESTAMP_S '2023-01-01'`（epoch 秒 = 1,672,531,200）会被错误地除以 1,000,000 得到 1672，写回时再乘以 1,000,000 得到 1,672,000,000，被解释为约公元 52977 年。
+Consequence: `TIMESTAMP_S '2023-01-01'`, epoch seconds 1,672,531,200, was divided by 1,000,000 to 1672. Writing it back by multiplying again produced 1,672,000,000 microseconds, interpreted as a date around year 52977.
 
-**发现方式**：@oracle 在 P0 实现审查中发现。TIMESTAMP_NS 当时是正确的（使用了 `GetEpochNanoSeconds(timestamp_ns_t)` 重载，直接返回 `.value`），但 SEC 和 MS 没有对应的正确重载使用。
-
-**解决方案**：直接读取物理类型的 `.value` 字段，绕过 epoch 转换辅助函数：
+The fix is to read the physical `.value` directly:
 
 ```cpp
 case LogicalTypeId::TIMESTAMP_SEC:
@@ -390,207 +425,212 @@ case LogicalTypeId::TIMESTAMP_MS:
     return static_cast<double>(UnifiedVectorFormat::GetData<timestamp_ms_t>(data)[idx].value);
 ```
 
-写回时也直接构造对应的物理类型，不使用 `FromEpochSeconds` / `FromEpochMs`。
+The writer also constructs the corresponding physical timestamp type directly instead of using `FromEpochSeconds` or `FromEpochMs`.
 
-**教训**：DuckDB 的时间戳变体有不同的物理存储单位，不能假设所有变体都使用微秒。必须为每种变体使用正确的物理类型和转换方式。添加了 TIMESTAMP_SEC 和 TIMESTAMP_MS 的往返测试以防止回归。
+Lesson: DuckDB timestamp variants use different physical storage units. Each variant needs a conversion path that matches its physical type. Round-trip tests for `TIMESTAMP_SEC` and `TIMESTAMP_MS` guard against regression.
 
-### 5.2 SQLNULL 类型导致向后兼容破坏
+### 5.2 SQLNULL Backward Compatibility
 
-**问题**：P0 实现将 bind 函数从"接受 ANY 并隐式转换为 DOUBLE"改为"显式校验类型集合"。但 `lttb(NULL, 1.0, 1)` 中的 `NULL` 字面量类型是 `SQLNULL`，不在支持集合内，导致抛出异常。原有测试中有一个 `lttb(NULL, 1.0, 1)` 的用例，之前能通过是因为 ANY→DOUBLE 的隐式转换。
+The P0 implementation changed binding from "accept ANY and implicitly cast to DOUBLE" to "explicitly validate supported types". The literal `NULL` in `lttb(NULL, 1.0, 1)` has type `SQLNULL`, which is not in the supported-type set, so an existing test started failing.
 
-**解决方案**：在 bind 函数中将 `SQLNULL` 强制转为 `DOUBLE`：
+The fix coerces untyped `SQLNULL` to `DOUBLE` in the binder:
 
 ```cpp
 const auto &x_resolved = x_type.id() == LogicalTypeId::SQLNULL ? LogicalType::DOUBLE : x_type;
 ```
 
-这保持了无类型 NULL 字面量的向后兼容性，同时仍然拒绝 VARCHAR 等不支持的类型。
+This preserves backward compatibility for untyped NULL literals while still rejecting unsupported types such as VARCHAR.
 
-### 5.3 `%llu` 格式化的跨平台可移植性
+### 5.3 Portable Formatting for idx_t
 
-**问题**：错误消息中使用 `%llu` 格式化 `idx_t`（即 `uint64_t`）。但在 LP64 Linux 上 `uint64_t` 是 `unsigned long`（应用 `%lu`），在 macOS 上是 `unsigned long long`（应用 `%llu`）。clang-tidy 的 `google-runtime-int` 检查也会对 `unsigned long long` 发出警告。
+Error messages originally formatted `idx_t` with `%llu`. On LP64 Linux, `uint64_t` is `unsigned long`, so `%lu` would be correct; on macOS, `uint64_t` is `unsigned long long`, so `%llu` is correct. clang-tidy's `google-runtime-int` check also warns on `unsigned long long`.
 
-**解决方案**：改用 `std::to_string(MAX_LTTB_POINTS)` 字符串拼接，完全避免格式说明符与类型不匹配的问题：
+The fix uses `std::to_string(MAX_LTTB_POINTS)` and string concatenation:
 
 ```cpp
 throw InvalidInputException("lttb aggregate state exceeded maximum point count of " +
                             std::to_string(MAX_LTTB_POINTS));
 ```
 
-### 5.4 未使用的 `decimal.hpp` 头文件
+### 5.4 Unused decimal.hpp Include
 
-**问题**：clang-tidy 报告 `decimal.hpp` 未被直接使用。`DecimalType::GetScale()` 和 `PhysicalType` 实际上定义在 `types.hpp` 中，已通过 `vector.hpp` 传递性包含。
+clang-tidy reported that `decimal.hpp` was not directly used. `DecimalType::GetScale()` and `PhysicalType` are available through existing DuckDB headers, so the direct include was removed.
 
-**解决方案**：移除 `#include "duckdb/common/types/decimal.hpp"`。
+### 5.5 Combine Reallocation Cost
 
-### 5.5 Combine 性能：几何重分配
+The original `LTTBCombine` inserted source points without reserving capacity first, which could trigger repeated vector reallocations when many partial states were merged.
 
-**问题**：原始 `LTTBCombine` 在 `insert` 前不 `reserve`，导致每次合并都可能触发向量的几何重分配。对于多分区并行执行的查询（许多部分状态需要合并），这会造成不必要的多次拷贝和重分配。
+The fix has two layers:
 
-**解决方案**：两层优化：
-1. **指针转移**：当目标状态为空时，直接转移源向量指针（O(1)），源指针置空防止双重释放。
-2. **reserve + insert**：当目标已有数据时，先 `reserve(target.size + source.size)` 再 `insert`，确保单次分配。
+1. **Pointer transfer**: if the target state is empty, transfer the source vector pointer in O(1) and null the source pointer.
+2. **reserve + insert**: if the target already has data, reserve `target.size + source.size` before inserting, ensuring one allocation.
 
-### 5.6 测试文件语法错误
+### 5.6 SQLLogicTest Syntax
 
-**问题**：SQLLogicTest 格式要求每个 `statement` / `query` 块之间有空行分隔。最初添加测试时，连续的 `statement ok` 块之间缺少空行，导致解析器将下一个 `statement` 关键字当作 SQL 的一部分，报 "syntax error at or near statement"。
+SQLLogicTest requires a blank line between `statement` and `query` blocks. Early added tests omitted blank lines between consecutive `statement ok` blocks, causing the parser to read the next `statement` keyword as SQL text.
 
-**解决方案**：确保所有 `statement` / `query` 块之间都有空行分隔。
-
----
-
-## 6. 设计决策与权衡
-
-### 6.1 为什么算法在 double 上运行
-
-LTTB 的核心是排序和三角形面积计算。在 `double` 上运行算法意味着：
-- **算法实现只需一份**：不需要为每种输入类型模板化算法核心。
-- **排序正确性有保证**：所有支持的类型到 `double` 的转换都是单调的，排序结果一致。
-- **精度可接受**：
-  - 微秒时间戳在 `double`（53 位尾数）中可无损表示直到约公元 2250 年。
-  - DECIMAL 超过 15 位有效数字时会有精度损失，但 LTTB 是可视化降采样，1 ULP 的抖动对视觉效果无影响。
-
-**代价**：类型转换在 I/O 边界有额外开销。但这个开销是 O(n) 的，而排序是 O(n log n)，转换不是瓶颈。
-
-### 6.2 为什么用 stable_sort 而不是 sort
-
-ClickHouse 使用不稳定的 `::sort`，相同 `x` 值的点的相对顺序未定义。DuckDB 使用 `std::stable_sort`，保证相同 `x` 值的点保持插入顺序。
-
-**理由**：
-- 确定性输出：相同查询多次执行结果一致，便于测试和调试。
-- 用户直觉：用户通常期望相同时间戳的数据点保持数据库中的出现顺序。
-- Python `lttb` 包完全拒绝重复 `x` 值，DuckDB 的稳定排序是更友好的中间方案。
-
-**代价**：`stable_sort` 的时间复杂度为 O(n log²n)（最坏情况）vs `sort` 的 O(n log n)。对于 LTTB 的典型工作负载（万到百万级点），差异不显著。
-
-### 6.3 为什么 combine 用指针转移而不是 move
-
-`std::move` 一个 `std::vector` 会将源向量置空，但 DuckDB 的 `LTTBDestroy` 会在 combine 之后对源状态调用 `delete`。如果用 `std::move`，源指针指向的 vector 对象仍然存在（只是内容被移走），Destroy 中的 `delete` 仍然正确。
-
-但直接指针转移更简洁：`target.points = source.points; source.points = nullptr;`。这完全避免了 vector 对象的移动构造/析构，且语义清晰——源放弃所有权，目标接管。Destroy 对 `nullptr` 的 `delete` 是安全的无操作。
-
-### 6.4 为什么 arena 集成被推迟
-
-ClickHouse 使用 Arena 分配器（`allocatesMemoryInArena() = true`）。评估后发现：
-- DuckDB 的 `ArenaAllocator` 与 `std::vector` 的集成非平凡——vector 内部管理自己的内存，不能直接用 arena 分配。
-- DuckDB 自身的聚合函数（如 `first`/`last`）也使用 `new`/`delete` 模式，不是所有聚合都用 arena。
-- 当前模式在 Destroy 中正确释放，没有内存泄漏。
-- combine 的指针转移优化已经改善了内存行为。
-
-推迟到有明确需求（如生产环境报告内存压力）时再实现。
-
-### 6.5 为什么 lttb_sorted 是独立函数而不是参数
-
-考虑过两种方案：
-1. **独立函数** `lttb_sorted(x, y, n)`：调用方明确表达"我保证输入已排序"。
-2. **额外参数** `lttb(x, y, n, skip_sort := true)`：通过参数控制。
-
-选择独立函数的理由：
-- 语义清晰：函数名本身表达了前置条件。
-- 不破坏现有 `lttb(x, y, n)` 的三参数签名。
-- DuckDB 的函数注册机制天然支持多个函数名共享同一实现。
-- 避免用户误传 `skip_sort=true` 但输入未排序导致的静默错误结果。
-
-### 6.6 为什么 lttb_indices 返回排序后位置索引
-
-`lttb_indices` 返回的是选中点在**排序后**数组中的 0-based 位置索引，不是原始插入顺序的行号。
-
-**理由**：
-- 排序后位置索引是算法内部的自然产物，不需要额外跟踪原始行号。
-- 原始行号在并行 combine 场景下难以维护（不同分区的行号会冲突）。
-- 排序后索引对于前端可视化足够有用——前端可以先将数据排序，然后用索引引用排序后的数据。
+The fix is to keep blank lines between all SQLLogicTest blocks.
 
 ---
 
-## 7. 与 ClickHouse / Python 的对比
+## 6. Design Decisions and Tradeoffs
 
-| 维度 | DuckDB (本扩展) | ClickHouse | Python `lttb` |
+### 6.1 Why the Algorithm Runs on double
+
+The LTTB core is sorting plus triangle-area computation. Running the core on `double` means:
+
+- **One algorithm implementation**: no templated algorithm core per input type.
+- **Correct ordering**: all supported conversions are monotonic, so sorting order is preserved.
+- **Acceptable precision**:
+  - Microsecond timestamps fit exactly in double's 53-bit mantissa until roughly year 2250.
+  - DECIMAL values with more than about 15 significant digits can lose precision, but LTTB is visual downsampling and 1-ULP jitter does not affect the visual outcome.
+
+The cost is type conversion at the I/O boundary. That cost is O(n), while sorting is O(n log n), so conversion is not the bottleneck.
+
+### 6.2 Why stable_sort Instead of sort
+
+ClickHouse uses unstable `::sort`, so points with equal `x` can have undefined relative order. DuckDB uses `std::stable_sort`, preserving insertion order for equal `x` values.
+
+Reasons:
+
+- Deterministic output across repeated queries.
+- Better match for user expectations around duplicate timestamps.
+- Python `lttb` rejects duplicate x values entirely, so stable sorting is a more useful middle ground.
+
+The cost is worst-case O(n log^2 n) for `stable_sort` vs O(n log n) for `sort`. For typical LTTB workloads from tens of thousands to millions of points, the measured difference is acceptable.
+
+### 6.3 Why Combine Transfers Pointers Instead of Moving Vectors
+
+Moving a `std::vector` would leave the source vector object valid but empty, and DuckDB's Destroy path would still delete the source vector object correctly. Direct pointer transfer is simpler:
+
+```cpp
+target.points = source.points;
+source.points = nullptr;
+```
+
+This avoids vector move construction/destruction and makes ownership explicit: the source gives up ownership and the target takes it. Deleting `nullptr` in Destroy is safe.
+
+### 6.4 Why Arena Integration Is Deferred
+
+ClickHouse uses an Arena allocator through `allocatesMemoryInArena() = true`. For DuckDB, integration is not straightforward:
+
+- `std::vector` owns its internal memory and cannot directly use DuckDB's arena without allocator work.
+- DuckDB's own aggregate functions, such as `first` and `last`, also use explicit heap allocation patterns.
+- The current Destroy path releases memory correctly.
+- Combine pointer transfer already improves memory behavior.
+
+Arena integration is deferred until there is concrete production pressure that justifies the complexity.
+
+### 6.5 Why lttb_sorted Is a Separate Function
+
+Two designs were considered:
+
+1. Separate function: `lttb_sorted(x, y, n)`, where the function name states the precondition.
+2. Extra parameter: `lttb(x, y, n, skip_sort := true)`.
+
+The separate function was chosen because it is explicit, preserves the existing three-argument `lttb` signature, fits DuckDB's registration model, and reduces the chance that users accidentally pass `skip_sort=true` on unsorted input and get silently wrong results.
+
+### 6.6 Why lttb_indices Returns Sorted Positions
+
+`lttb_indices` returns selected 0-based positions in the sorted point array, not original insertion-order row numbers.
+
+Reasons:
+
+- Sorted positions are the natural byproduct of the algorithm.
+- Original row numbers are difficult to maintain correctly through parallel combine, where different partitions can have conflicting local row positions.
+- Sorted indices are useful enough for frontends: the frontend can sort the input data and use the indices to reference the sorted array.
+
+---
+
+## 7. Comparison with ClickHouse and Python
+
+| Dimension | DuckDB, this extension | ClickHouse | Python `lttb` |
 |---|---|---|---|
-| 内部排序 | 是，stable_sort | 是，不稳定 ::sort | 否，要求预排序 |
-| 重复 x | 保留，稳定顺序 | 保留，顺序未定义 | 拒绝（校验器） |
-| n=0/1/2 | 优雅处理 | 优雅处理 | ValueError |
-| n > 输入 | 返回全部排序点 | 返回全部排序点 | ValueError |
-| NaN | 跳过该行 | 跳过该行 | 拒绝（校验器） |
-| Inf | 保留（与 CH/Python 一致） | 保留 | 不处理 |
-| NULL | 跳过（validity mask） | 无显式处理 | N/A |
-| 输入类型 | 数值 + 时间 + DECIMAL | 数值 + Date/DateTime | numpy 数组 |
-| 输出类型 | 保持 x/y 类型 | 保持 x 类型 | 保持 dtype |
-| 索引输出 | `lttb_indices` | 无 | 无 |
-| 排序快速路径 | `lttb_sorted` | 无 | N/A（要求预排序） |
-| MinMax 近似 | `minmax_lttb` | 无 | `MinMaxLTTB`（plotly-resampler） |
-| 桶统计 | `bucket_stats` | 无 | 无 |
-| 类型分发 | bind 时函数指针 | 模板 | N/A |
-| 内存模型 | O(n)，new/delete | O(n)，Arena | O(n)，numpy |
-| 最大点数 | 1 << 30 | 1 << 30 | N/A |
-| Combine | 指针转移 + reserve | 拼接 + 排序 | N/A |
-| 空桶保护 | 有（回退到最后一点） | 无（源码层面） | N/A |
+| Internal sorting | Yes, `stable_sort` | Yes, unstable `::sort` | No, requires pre-sorted input |
+| Duplicate x | Preserved, stable order | Preserved, undefined order | Rejected by validator |
+| n=0/1/2 | Gracefully handled | Gracefully handled | `ValueError` |
+| n > input | Returns all sorted points | Returns all sorted points | `ValueError` |
+| NaN | Skips row | Skips row | Rejected by validator |
+| Inf | Preserved, consistent with CH/Python | Preserved | Not specially handled |
+| NULL | Skipped via validity mask | No explicit handling | N/A |
+| Input types | Numeric + temporal + DECIMAL | Numeric + Date/DateTime | NumPy arrays |
+| Output types | Preserves x/y types | Preserves x type | Preserves dtype |
+| Index output | `lttb_indices` | None | None |
+| Sorted fast path | `lttb_sorted` | None | N/A, requires pre-sorted input |
+| MinMax approximation | `minmax_lttb` | None | `MinMaxLTTB`, plotly-resampler |
+| Bucket statistics | `bucket_stats` | None | None |
+| Type dispatch | Bind-time function pointers | Templates | N/A |
+| Memory model | O(n), new/delete | O(n), Arena | O(n), NumPy |
+| Maximum point count | `1 << 30` | `1 << 30` | N/A |
+| Combine | Pointer transfer + reserve | Concatenate + sort | N/A |
+| Empty-bucket guard | Yes, fallback to last point | No explicit source-level guard | N/A |
 
-**DuckDB 的改进**：稳定排序、空桶保护、NULL 处理、排序快速路径、索引输出、MinMax 近似路径、桶统计、bind 时函数指针分发。
+DuckDB improvements include stable sorting, empty-bucket protection, NULL handling, a sorted fast path, selected-index output, MinMax approximation, bucket statistics, and bind-time function-pointer dispatch.
 
-**DuckDB 的待改进项**：Arena 集成、用户可配置内存上限、SIMD 三角形面积加速。
+Remaining improvement areas include Arena integration, a user-configurable memory limit, and SIMD acceleration for triangle-area computation.
 
 ---
 
-## 8. 测试策略
+## 8. Test Strategy
 
-测试使用 DuckDB 的 SQLLogicTest 框架，集中在 `test/sql/lttb.test`（125 个断言）。
+Tests use DuckDB's SQLLogicTest framework and live in `test/sql/lttb.test`, currently around 125 assertions.
 
-### 测试覆盖
+### Coverage
 
-| 类别 | 测试内容 |
+| Category | Coverage |
 |---|---|
-| 基本功能 | ClickHouse 标准示例、n=0/1/2/20、n>输入、range 生成 |
-| 类型保持 | 直接 DATE/TIMESTAMP/TIMESTAMPTZ/TIMESTAMP_S/MS/NS 输入、DECIMAL 往返、非对称 x/y 类型 |
-| 边界情况 | NaN 跳过、NULL 跳过（DOUBLE 和类型化）、全无效输入、Inf 处理（+Inf/-Inf x） |
-| 重复 x | 透传模式（n=输入数）、桶选择模式（n<输入数） |
-| 错误处理 | 负 n、组内非恒定 n、VARCHAR 拒绝、HUGEINT 越界写回 |
-| 并行/合并 | 3 组 GROUP BY 测试 combine 路径 |
-| ClickHouse 回归 | PR #57003 桶边界回归测试 |
-| lttb_sorted | 排序输入快速路径（DOUBLE 和 TIMESTAMP） |
-| lttb_indices | 索引输出（n=4、n=0、n=1） |
-| minmax_lttb | 小输入退化为标准 LTTB、NULL 默认 ratio、n=0、n>=输入、ratio<=1 错误、负 n 错误、ratio 恒定性错误、TIMESTAMP 类型保持 |
-| bucket_stats | 3 桶 6 点统计、n=0、n=1、n>=输入、负 n 错误、TIMESTAMP 类型保持 |
+| Basic behavior | ClickHouse canonical example, n=0/1/2/20, n>input, range-generated input |
+| Type preservation | Direct DATE/TIMESTAMP/TIMESTAMPTZ/TIMESTAMP_S/MS/NS input, DECIMAL round trips, asymmetric x/y types |
+| Edge cases | NaN skipped, NULL skipped for DOUBLE and typed input, all-invalid input, Inf handling for +Inf/-Inf x |
+| Duplicate x | Pass-through mode when n equals input size, bucket-selection mode when n is smaller |
+| Error handling | Negative n, non-constant n within group, VARCHAR rejection, HUGEINT writeback overflow |
+| Parallel/combine | 3-group GROUP BY test for the combine path |
+| ClickHouse regression | PR #57003 bucket-boundary regression test |
+| lttb_sorted | Sorted-input fast path for DOUBLE and TIMESTAMP |
+| lttb_indices | Index output for n=4, n=0, and n=1 |
+| minmax_lttb | Small-input fallback to standard LTTB, NULL default ratio, n=0, n>=input, ratio<=1 error, negative n error, ratio constancy error, TIMESTAMP type preservation |
+| bucket_stats | 3-bucket 6-point statistics, n=0, n=1, n>=input, negative n error, TIMESTAMP type preservation |
 
-### 测试方法
+### Test Methods
 
-- **输出格式化**：使用 `list_transform` + `format` 将 STRUCT 列表转为字符串列表进行断言，避免浮点格式化差异。
-- **时间格式化**：使用 `strftime` 将 TIMESTAMP 输出格式化为 `%Y-%m-%d` 字符串。
-- **rowsort**：GROUP BY 测试使用 `rowsort` 排序模式，避免组间顺序不确定性。
+- **Output formatting**: use `list_transform` and `format` to convert lists of STRUCT values to string lists, avoiding floating-point formatting differences.
+- **Time formatting**: use `strftime` to format TIMESTAMP output as `%Y-%m-%d`.
+- **rowsort**: GROUP BY tests use SQLLogicTest `rowsort` mode to avoid relying on group output order.
 
 ---
 
-## 9. 文件清单
+## 9. File Map
 
-```
+```text
 duckdb-lttb/
-├── src/
-│   ├── include/
-│   │   └── ltb_extension.hpp      # 扩展头文件（Extension 类声明）
-│   └── lttb_extension.cpp         # 全部实现（约 1480 行）
-├── test/
-│   └── sql/
-│       └── lttb.test              # SQLLogicTest 测试（125 断言）
-├── docs/
-│   ├── reference/
-│   │   └── clickhouse-lttb.md     # ClickHouse 参考行为归档
-│   ├── benchmark.md               # 性能基准测试结果
-│   ├── UPDATING.md                # DuckDB 版本升级指南
-│   └── architecture.md            # 本文档
-├── scripts/
-│   └── benchmark.sh               # 性能基准测试（三方对比 + 函数级对比）
-├── CMakeLists.txt                 # 构建配置
-├── extension_config.cmake         # 扩展配置
-├── Makefile                       # 构建入口
-├── README.md                      # 用户文档
-└── TODO.md                        # 待办事项与优化路线图
++-- src/
+|   +-- include/
+|   |   +-- lttb_extension.hpp      # Extension class declaration
+|   +-- lttb_extension.cpp          # Full implementation, about 1480 lines
++-- test/
+|   +-- sql/
+|       +-- lttb.test               # SQLLogicTest suite, about 125 assertions
++-- docs/
+|   +-- reference/
+|   |   +-- clickhouse-lttb.md      # Archived ClickHouse reference behavior
+|   +-- benchmark.md                # Benchmark results
+|   +-- UPDATING.md                 # DuckDB version update guide
+|   +-- architecture.md             # This document
++-- scripts/
+|   +-- benchmark.sh                # Benchmarks: three-way comparison + function-level comparison
++-- CMakeLists.txt                  # Build configuration
++-- extension_config.cmake          # Extension configuration
++-- Makefile                        # Build entry point
++-- README.md                       # User documentation
++-- TODO.md                         # Backlog and optimization roadmap
 ```
 
 ---
 
-## 10. 未来展望
+## 10. Future Work
 
-根据 `TODO.md`，尚未实现或已推迟的功能：
+According to `TODO.md`, the following work is not implemented or has been deferred:
 
-1. **用户可配置内存上限**（推迟）：通过 PRAGMA 设置或 FunctionData 传递每组最大点数，用于生产环境的大查询保护。当前硬性上限 `1 << 30` 足够慷慨，推迟到生产用户报告需要更低上限时再实现。
-2. **Arena 集成**（推迟）：将状态分配迁移到 DuckDB 的 ArenaAllocator，减少堆分配碎片。`std::vector` 与 Arena 的集成非平凡，且当前 `new`/`delete` 模式在 Destroy 中正确释放，推迟到有明确内存压力需求时再实现。
-3. **SIMD 三角形面积加速**（推迟）：使用 AVX2（x86）/ NEON（ARM）同时处理 4 个候选点的三角形面积计算。推迟到 `lttb_sorted` 在 PulseOn 中落地且性能分析显示三角形面积循环仍占 >25% 总时间时再评估。
+1. **User-configurable memory limit**, deferred: expose a PRAGMA or FunctionData setting for maximum points per group, useful as a production query guard. The current hard limit of `1 << 30` is intentionally generous; a lower configurable limit can wait for real production need.
+2. **Arena integration**, deferred: move state allocation to DuckDB's `ArenaAllocator` to reduce heap fragmentation. Integrating `std::vector` with Arena is non-trivial, and the current `new`/`delete` path releases memory correctly.
+3. **SIMD triangle-area acceleration**, deferred: use AVX2 on x86 or NEON on ARM to evaluate four candidate triangle areas at once. Revisit after `lttb_sorted` is deployed in PulseOn and profiling shows the triangle-area loop is still more than 25% of total runtime.

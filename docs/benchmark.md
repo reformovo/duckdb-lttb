@@ -1,38 +1,38 @@
-# LTTB 性能对比：DuckDB vs ClickHouse vs Python
+# LTTB Performance: DuckDB vs ClickHouse vs Python
 
-## 测试环境
+## Test Environment
 
-| 项目 | 版本/配置 |
+| Item | Version / Configuration |
 |---|---|
-| DuckDB | v1.5.3（本地编译，Release，ninja + ccache） |
-| DuckDB lttb 扩展 | 本项目，C++ 原生聚合函数 |
-| ClickHouse | v25.7.1.3997（`clickhouse-server:latest-alpine`） |
-| Python lttb | 0.3.2（pip 安装，numpy 后端） |
-| Python duckdb | 1.4.5（pip 安装） |
+| DuckDB | v1.5.3, local Release build, ninja + ccache |
+| DuckDB lttb extension | This project, native C++ aggregate functions |
+| ClickHouse | v25.7.1.3997, `clickhouse-server:latest-alpine` |
+| Python lttb | 0.3.2, installed with pip, NumPy backend |
+| Python duckdb | 1.4.5, installed with pip |
 | NumPy | 1.26.4 |
-| 运行环境 | macOS arm64（Apple Silicon） |
-| ClickHouse 运行方式 | Apple Container（Linux/arm64 虚拟化框架） |
-| DuckDB 运行方式 | 原生 macOS arm64 二进制 |
-| 测试方法 | best of 5 runs |
-| 数据集 | 合成正弦波 `sin(i/scale)`，DOUBLE 类型 |
+| Runtime environment | macOS arm64, Apple Silicon |
+| ClickHouse runtime | Apple Container, Linux/arm64 virtualization framework |
+| DuckDB runtime | Native macOS arm64 binary |
+| Method | Best of 5 runs |
+| Dataset | Synthetic sine wave, `sin(i/scale)`, DOUBLE values |
 
-### 计时方法说明
+### Timing Method
 
-| 实现 | 计时方式 | 包含的开销 |
+| Implementation | Timing Source | Included Overhead |
 |---|---|---|
-| DuckDB | CLI `.timer on` | 子进程启动 + SQL 解析 + 查询执行 |
-| ClickHouse | `clickhouse-client --time` | 服务端查询执行（不含连接/传输） |
-| Python | `time.perf_counter` | 数据获取(fetchall) + numpy 转换 + lttb.downsample |
+| DuckDB | CLI `.timer on` | Subprocess startup + SQL parsing + query execution |
+| ClickHouse | `clickhouse-client --time` | Server-side query execution, excluding connection and transfer |
+| Python | `time.perf_counter` | Data fetch (`fetchall`) + NumPy conversion + `lttb.downsample` |
 
-> **注意**：DuckDB 的计时包含 CLI 子进程启动开销（约 1ms），ClickHouse 的计时是服务端纯查询时间。因此 DuckDB 的实际查询执行时间比表中数值更低。Python 的计时包含从 DuckDB 获取数据的 fetchall 开销，这是 Python UDF 方式的固有成本。
+> **Note**: DuckDB timings include CLI subprocess startup overhead, about 1 ms. ClickHouse timings are server-side query execution times only. Therefore, DuckDB's actual query execution time is lower than the table values. Python timings include the `fetchall` overhead from DuckDB, which is an inherent cost of a Python UDF-style workflow.
 
 ---
 
-## 1. 已排序 DOUBLE 输入
+## 1. Sorted DOUBLE Input
 
-三种实现对相同已排序正弦波数据降采样的耗时对比：
+The following table compares downsampling the same sorted sine-wave dataset with all three implementations:
 
-| 数据量 | n_out | DuckDB (ms) | ClickHouse (ms) | Python (ms) | DuckDB/CH |
+| Input Size | n_out | DuckDB (ms) | ClickHouse (ms) | Python (ms) | DuckDB/CH |
 |---|---|---|---|---|---|
 | 10K | 100 | 1.0 | 2.0 | 3.1 | 0.50x |
 | 10K | 1000 | 1.0 | 2.0 | 9.8 | 0.50x |
@@ -44,172 +44,172 @@
 | 1M | 1000 | 16.0 | 18.0 | 247.9 | 0.88x |
 | 1M | 10000 | 16.0 | 19.0 | 311.8 | 0.84x |
 
-### 分析
+### Analysis
 
-- **DuckDB 在所有规模下均最快**，ClickHouse 次之，Python 最慢。
-- **10K-100K**：DuckDB 比 ClickHouse 快 1.5-2x，比 Python 快 3-48x。DuckDB 的 CLI 启动开销约 1ms，在此规模下占比较大但仍最快。
-- **1M**：DuckDB 与 ClickHouse 接近持平（16ms vs 18ms，比值 0.88x），两者均为 C++ 原生实现，算法核心性能相当。Python 为 248ms，慢 15x。
-- **Python 的 n_out 敏感性**：Python 在 n_out=10000 时显著变慢（100K 数据 96ms vs n_out=100 的 26ms），因为 `np.array_split` 和逐桶循环的开销随桶数增长。DuckDB 和 ClickHouse 对 n_out 不敏感。
+- **DuckDB is fastest at every tested scale**, followed by ClickHouse, with Python slowest.
+- **10K-100K**: DuckDB is 1.5-2x faster than ClickHouse and 3-48x faster than Python. DuckDB's roughly 1 ms CLI startup overhead is a meaningful share at this size, but DuckDB still leads.
+- **1M**: DuckDB and ClickHouse are close, 16 ms vs 18 ms, a 0.88x ratio. Both are native C++ implementations, so the core algorithm cost is similar. Python takes 248 ms, about 15x slower.
+- **Python sensitivity to n_out**: Python slows down substantially at `n_out=10000`, for example 96 ms on 100K rows vs 26 ms at `n_out=100`, because `np.array_split` and the per-bucket loop scale with the number of buckets. DuckDB and ClickHouse are much less sensitive to `n_out`.
 
 ---
 
-## 2. 打乱输入（排序成本）
+## 2. Shuffled Input and Sorting Cost
 
-对随机打乱顺序的输入进行降采样，测试内部排序的成本：
+This test downsamples randomly shuffled input and measures the cost of internal sorting:
 
-| 数据量 | n_out | DuckDB (ms) | ClickHouse (ms) | Python (ms)* |
+| Input Size | n_out | DuckDB (ms) | ClickHouse (ms) | Python (ms)* |
 |---|---|---|---|---|
 | 10K shuffled | 1000 | 1.0 | 2.0 | 9.9 |
 | 100K shuffled | 1000 | 6.0 | 8.0 | 31.6 |
 | 1M shuffled | 1000 | 74.0 | 85.0 | 244.5 |
 
-> *Python `lttb` 包要求输入严格递增，无法处理打乱数据。此处 Python 使用已排序数据，仅作为参考基线。
+> *The Python `lttb` package requires strictly increasing input and cannot process shuffled data. The Python value uses sorted input and is included only as a reference baseline.
 
-### 分析
+### Analysis
 
-- **DuckDB 在打乱输入下仍快于 ClickHouse**：1M 打乱数据 74ms vs 85ms（0.87x）。
-- **排序成本**（与已排序对比）：
-  - DuckDB：1M 排序成本 = 74ms - 16ms = **58ms**（占总时间 78%）
-  - ClickHouse：1M 排序成本 = 85ms - 18ms = **67ms**（占总时间 79%）
-  - 两者排序成本接近，DuckDB 略优。
-- **Python 无法处理打乱输入**——这是 DuckDB/ClickHouse 作为数据库聚合函数的核心优势：用户不需要预先排序数据。
+- **DuckDB remains faster than ClickHouse on shuffled input**: 74 ms vs 85 ms on 1M shuffled rows, a 0.87x ratio.
+- **Sorting cost**, compared with sorted input:
+  - DuckDB: 1M sorting cost = 74 ms - 16 ms = **58 ms**, 78% of total time.
+  - ClickHouse: 1M sorting cost = 85 ms - 18 ms = **67 ms**, 79% of total time.
+  - The two sorting costs are close, with DuckDB slightly ahead.
+- **Python cannot process shuffled input**, which is a key advantage of database aggregate implementations: users do not have to pre-sort their data outside SQL.
 
 ---
 
-## 3. TIMESTAMP / DateTime 输入
+## 3. TIMESTAMP / DateTime Input
 
-测试时间戳类型输入的类型转换开销：
+This test measures the conversion overhead for timestamp-like input:
 
-| 数据量 | n_out | DuckDB (ms) | ClickHouse (ms) | Python (ms) |
+| Input Size | n_out | DuckDB (ms) | ClickHouse (ms) | Python (ms) |
 |---|---|---|---|---|
 | 100K TIMESTAMP | 1000 | 2.0 | 3.0 | 31.7 |
 | 1M TIMESTAMP | 1000 | 16.0 | 17.0 | 254.7 |
 
-### 分析
+### Analysis
 
-- **类型转换开销可忽略**：DuckDB 和 ClickHouse 的 TIMESTAMP/DateTime 输入与 DOUBLE 输入耗时几乎相同（2ms vs 2ms，16ms vs 16ms）。两者都在内部转换为 epoch double 进行计算。
-- **Python** 的 TIMESTAMP 耗时与 DOUBLE 相近（254ms vs 248ms），因为 Python 版本将时间戳作为 double 获取，转换开销被 fetchall 主导。
-- **DuckDB 保持输出类型**：`lttb(x, y, n)` 当 x 为 TIMESTAMP 时返回 `STRUCT(x TIMESTAMP, y DOUBLE)[]`，用户无需手动 `to_timestamp()` 重建。ClickHouse 同样保持类型。Python 保持 numpy dtype。
+- **Type conversion overhead is negligible**: DuckDB and ClickHouse have almost identical timings for TIMESTAMP/DateTime and DOUBLE input, for example 2 ms vs 2 ms and 16 ms vs 16 ms. Both convert internally to epoch-style double values for computation.
+- **Python** TIMESTAMP timing is close to DOUBLE timing, 254 ms vs 248 ms, because the Python version receives timestamps as doubles and is dominated by `fetchall`.
+- **DuckDB preserves output types**: `lttb(x, y, n)` returns `STRUCT(x TIMESTAMP, y DOUBLE)[]` when `x` is TIMESTAMP, so users do not have to reconstruct timestamps manually with `to_timestamp()`. ClickHouse also preserves the x type, and Python preserves NumPy dtypes.
 
 ---
 
-## 4. 多组 GROUP BY
+## 4. Multi-Group GROUP BY
 
-测试 100 组并行降采样（每组 1K-10K 点）的 combine 路径性能：
+This test measures the combine path while downsampling 100 groups in parallel, with 1K-10K points per group:
 
-| 数据量 | n_out/组 | DuckDB (ms) | ClickHouse (ms) |
+| Input Size | n_out/group | DuckDB (ms) | ClickHouse (ms) |
 |---|---|---|---|
-| 100K (100组) | 100 | 2.0 | 4.0 |
-| 1M (100组) | 100 | 12.0 | 21.0 |
+| 100K (100 groups) | 100 | 2.0 | 4.0 |
+| 1M (100 groups) | 100 | 12.0 | 21.0 |
 
-> Python `lttb` 包是纯函数，不支持 SQL GROUP BY 聚合，无法参与此对比。
+> The Python `lttb` package is a pure function and does not support SQL GROUP BY aggregation, so it is not included here.
 
-### 分析
+### Analysis
 
-- **DuckDB 在多组场景下优势显著**：1M 100 组时 12ms vs 21ms，快 **1.75x**。
-- DuckDB 的 combine 指针转移优化（当目标组为空时 O(1) 转移源向量指针）在多组场景下有效减少了内存拷贝。
-- 100K 100 组时每组仅 1000 点，DuckDB 2ms vs ClickHouse 4ms，快 2x。
+- **DuckDB has a clear advantage in multi-group workloads**: 12 ms vs 21 ms on 1M rows / 100 groups, **1.75x** faster.
+- DuckDB's combine optimization transfers the source vector pointer in O(1) when the target group is empty, reducing memory copies in grouped execution.
+- With 100K rows / 100 groups, each group has only 1000 points. DuckDB takes 2 ms vs ClickHouse's 4 ms, about 2x faster.
 
 ---
 
-## 5. 综合对比矩阵
+## 5. Summary Matrix
 
-| 维度 | DuckDB lttb | ClickHouse | Python lttb |
+| Dimension | DuckDB lttb | ClickHouse | Python lttb |
 |---|---|---|---|
-| **10K 已排序** | **1.0ms** | 2.0ms | 3.1ms |
-| **100K 已排序** | **2.0ms** | 3.0ms | 25.6ms |
-| **1M 已排序** | **16.0ms** | 18.0ms | 248ms |
-| **1M 打乱** | **74.0ms** | 85.0ms | N/A (不支持) |
-| **1M TIMESTAMP** | **16.0ms** | 17.0ms | 255ms |
-| **1M 100组** | **12.0ms** | 21.0ms | N/A (不支持) |
-| **内部排序** | 是 (stable_sort) | 是 (不稳定) | 否 (要求预排序) |
-| **类型保持** | 是 | 是 | 是 (numpy dtype) |
-| **GROUP BY** | 是 | 是 | 否 |
-| **打乱输入** | 支持 | 支持 | 不支持 |
-| **索引输出** | `lttb_indices` | 无 | 无 |
-| **排序快速路径** | `lttb_sorted` | 无 | N/A |
-| **实现语言** | C++ | C++ | Python (numpy) |
+| **10K sorted** | **1.0 ms** | 2.0 ms | 3.1 ms |
+| **100K sorted** | **2.0 ms** | 3.0 ms | 25.6 ms |
+| **1M sorted** | **16.0 ms** | 18.0 ms | 248 ms |
+| **1M shuffled** | **74.0 ms** | 85.0 ms | N/A, unsupported |
+| **1M TIMESTAMP** | **16.0 ms** | 17.0 ms | 255 ms |
+| **1M / 100 groups** | **12.0 ms** | 21.0 ms | N/A, unsupported |
+| **Internal sorting** | Yes, `stable_sort` | Yes, unstable | No, requires pre-sorted input |
+| **Type preservation** | Yes | Yes | Yes, NumPy dtype |
+| **GROUP BY** | Yes | Yes | No |
+| **Shuffled input** | Supported | Supported | Unsupported |
+| **Index output** | `lttb_indices` | None | None |
+| **Sorted fast path** | `lttb_sorted` | None | N/A |
+| **Implementation language** | C++ | C++ | Python, NumPy |
 
 ---
 
-## 6. 结论
+## 6. Conclusions
 
-### 性能排名
+### Performance Ranking
 
-1. **DuckDB lttb 扩展** — 在所有测试场景下最快
-2. **ClickHouse largestTriangleThreeBuckets** — 紧随其后，1M 规模下接近持平
-3. **Python lttb** — 显著慢于两者，且功能受限
+1. **DuckDB lttb extension**: fastest in every tested scenario.
+2. **ClickHouse largestTriangleThreeBuckets**: close behind, nearly tied at 1M rows.
+3. **Python lttb**: significantly slower and more limited.
 
-### 关键发现
+### Key Findings
 
-- **DuckDB vs ClickHouse**：两者均为 C++ 原生实现，1M 点时算法核心性能接近持平（16ms vs 18ms）。DuckDB 的优势主要来自：更低的进程启动开销（原生 macOS vs Linux 容器）、多组 combine 优化（指针转移，1.75x 优势）、以及更小的 n_out 敏感性。
-- **C++ vs Python**：在 1M 点时，C++ 实现（DuckDB/ClickHouse）比 Python 快 **15x**。Python 的瓶颈在于 `fetchall` 数据序列化、numpy 数组转换、以及逐桶 Python 循环。
-- **数据库聚合 vs 外部函数**：DuckDB 和 ClickHouse 作为数据库聚合函数，可以直接在 SQL 中使用 GROUP BY、WHERE 过滤、JOIN 等操作，无需将数据导出到外部环境。Python `lttb` 要求预排序且不支持 GROUP BY，在实际数据分析工作流中需要额外的数据搬运步骤。
-- **排序成本**：对于打乱输入，排序占总时间的 ~78%（DuckDB 58ms/74ms，ClickHouse 67ms/85ms）。`lttb_sorted` 快速路径可完全消除此成本，适用于已知数据已排序的场景（如时间序列主键有序表）。
+- **DuckDB vs ClickHouse**: Both are native C++ implementations and have similar core algorithm performance at 1M points, 16 ms vs 18 ms. DuckDB's advantage comes mainly from lower process overhead in this setup, native macOS vs Linux container, grouped combine optimization, and lower sensitivity to `n_out`.
+- **C++ vs Python**: At 1M points, the C++ implementations are about **15x** faster than Python. Python is bottlenecked by `fetchall` serialization, NumPy array conversion, and the per-bucket Python loop.
+- **Database aggregate vs external function**: DuckDB and ClickHouse can apply LTTB directly inside SQL with GROUP BY, WHERE filters, JOINs, and other relational operations. Python `lttb` requires pre-sorted input and does not support GROUP BY, so real workflows need additional data movement.
+- **Sorting cost**: For shuffled input, sorting accounts for about 78% of total runtime, 58 ms / 74 ms in DuckDB and 67 ms / 85 ms in ClickHouse. The `lttb_sorted` fast path removes this cost entirely when the caller can guarantee sorted input, for example on a table ordered by a time-series primary key.
 
-### 环境注意事项
+### Environment Notes
 
-- ClickHouse 运行在 Apple 虚拟化框架的 Linux 容器中，存在虚拟化开销。DuckDB 原生运行在 macOS 上。这一差异对 10K-100K 规模的计时有影响（进程启动/连接开销），但对 1M 规模的算法核心性能影响较小（两者接近持平）。
-- DuckDB 计时包含 CLI 子进程启动（~1ms），ClickHouse 计时为服务端纯查询时间。因此 DuckDB 的实际查询执行时间比表中数值更低。
-- Python 计时包含从 DuckDB 获取数据的 `fetchall` 开销，这是 Python UDF 方式的固有成本，在实际使用中无法避免。
+- ClickHouse ran inside a Linux container using Apple virtualization, while DuckDB ran natively on macOS. This affects 10K-100K timings through startup and connection overhead, but has less impact on 1M-scale core algorithm cost, where the two implementations are close.
+- DuckDB timings include CLI subprocess startup, about 1 ms. ClickHouse timings are server-side query time only. DuckDB's actual query execution time is therefore lower than the table values.
+- Python timings include `fetchall` from DuckDB, which is an inherent cost of the Python UDF-style workflow and cannot be avoided in that setup.
 
 ---
 
-## 7. 函数级性能对比（DuckDB 内部）
+## 7. Per-Function Performance Inside DuckDB
 
-对 DuckDB lttb 扩展的所有注册函数在相同数据集上进行性能对比，测试环境同上。这部分由 `scripts/benchmark.sh` 的 Part B（Section 5-10）生成，只需 DuckDB + 扩展，不需要 ClickHouse 或 Python。
+This section compares all registered functions from the DuckDB lttb extension on the same datasets and environment. It is generated by Part B, Sections 5-10, of `scripts/benchmark.sh`. It requires only DuckDB and the extension, not ClickHouse or Python.
 
-### 7.1 全函数对比（1M 已排序输入，n=1000）
+### 7.1 All Functions, 1M Sorted Input, n=1000
 
-| 函数 | 耗时 (ms) | 说明 |
+| Function | Time (ms) | Notes |
 |---|---|---|
-| `lttb` | 17.0 | 排序 + LTTB 采样 |
-| `lttb_sorted` | 10.0 | 跳过排序，直接 LTTB 采样 |
-| `lttb_indices` | 17.0 | 排序 + LTTB，输出索引 |
-| `minmax_lttb(r=4)` | 11.0 | bin-first 预选 + LTTB（跳过全量排序） |
-| `minmax_lttb(r=8)` | 10.0 | bin-first 预选（更大候选集）+ LTTB |
-| `minmax_lttb_sorted(r=4)` | 11.0 | 同 minmax_lttb，sorted 输入变体 |
-| `bucket_stats` | 16.0 | 等计数分桶 + 统计聚合 |
+| `lttb` | 17.0 | Sort + LTTB sampling |
+| `lttb_sorted` | 10.0 | Skip sorting, direct LTTB sampling |
+| `lttb_indices` | 17.0 | Sort + LTTB, output selected indices |
+| `minmax_lttb(r=4)` | 11.0 | Bin-first preselection + LTTB, skipping full sort |
+| `minmax_lttb(r=8)` | 10.0 | Bin-first preselection with a larger candidate set + LTTB |
+| `minmax_lttb_sorted(r=4)` | 11.0 | Same as `minmax_lttb`, sorted-input variant |
+| `bucket_stats` | 16.0 | Equal-count bucketing + statistical aggregation |
 
-### 分析
+### Analysis
 
-- **`lttb_sorted` 是最快的降采样函数**：10ms vs 17ms（`lttb`），排序成本 7ms（占总时间 41%）。适用于已知数据已排序的场景（如时间序列主键有序表）。
-- **`minmax_lttb` 现在有明显加速**：11ms vs `lttb` 17ms（**1.55x 加速**）。Phase 1 优化将原来的"先全量排序再预选"改为 bin-first 策略：扫描一次找 x 范围，将所有点分入等宽 x-bins 保留每桶 argmin/argmax，只对 ~n×ratio 个候选点排序后运行 LTTB。这消除了占 88% 运行时间的全量 `stable_sort`。`minmax_ratio` 从 4 增到 8 时候选集更大但 LTTB 仍快（10ms vs 11ms），因为候选集排序成本可忽略。
-- **`bucket_stats` 性能与 `lttb` 相当**：16ms vs 17ms。虽然不需要三角形面积计算，但需要排序 + 逐桶统计聚合（min/max/mean/std），计算量与 LTTB 相近。
-- **`lttb_indices` 与 `lttb` 性能相同**：索引输出的额外开销可忽略。
+- **`lttb_sorted` is the fastest downsampling function**: 10 ms vs 17 ms for `lttb`. The 7 ms sorting cost is 41% of total time. Use it when input ordering by `x` is already guaranteed.
+- **`minmax_lttb` now has a clear speedup**: 11 ms vs 17 ms for `lttb`, a **1.55x** improvement. The Phase 1 optimization replaced "full sort, then preselect" with a bin-first strategy: scan once to find the x range, assign all points to equal-width x-bins, keep each bin's argmin/argmax, sort only about `n * ratio` candidates, then run LTTB. This removes the full `stable_sort` that previously dominated runtime. Increasing `minmax_ratio` from 4 to 8 creates a larger candidate set, but LTTB remains fast because candidate sorting is negligible.
+- **`bucket_stats` is similar to `lttb`**: 16 ms vs 17 ms. It avoids triangle-area computation, but still performs sorting plus per-bucket min/max/mean/std aggregation.
+- **`lttb_indices` matches `lttb`**: the extra index output has negligible overhead.
 
-### 7.2 lttb vs lttb_sorted（排序成本）
+### 7.2 lttb vs lttb_sorted, Sorting Cost
 
-| 数据量 | n_out | lttb (ms) | lttb_sorted (ms) | 排序成本 (ms) |
+| Input Size | n_out | lttb (ms) | lttb_sorted (ms) | Sorting Cost (ms) |
 |---|---|---|---|---|
 | 10K | 1000 | 0.0 | 1.0 | ~0 |
 | 100K | 1000 | 2.0 | 1.0 | 1.0 |
 | 1M | 1000 | 15.0 | 9.0 | 6.0 |
 
-### 分析
+### Analysis
 
-- 排序成本随数据量线性增长：100K 时 1ms，1M 时 6ms。
-- 对于已排序输入，`lttb_sorted` 提供 **1.67x 加速**（1M 场景）。
-- 10K 规模下 CLI 启动开销（~1ms）主导计时，排序成本不可测量。
+- Sorting cost grows with input size: about 1 ms at 100K and 6 ms at 1M.
+- On sorted input, `lttb_sorted` provides a **1.67x speedup** at 1M rows.
+- At 10K rows, CLI startup overhead of about 1 ms dominates the timing, so sorting cost cannot be measured reliably.
 
-### 7.3 lttb vs minmax_lttb（预选收益与开销）
+### 7.3 lttb vs minmax_lttb, Preselection Benefit and Overhead
 
-| 数据量 | n_out | lttb (ms) | minmax_lttb (ms) | 加速比 |
+| Input Size | n_out | lttb (ms) | minmax_lttb (ms) | Speedup |
 |---|---|---|---|---|
 | 100K | 100 | 2.0 | 1.0 | 2.00x |
 | 100K | 1000 | 2.0 | 1.0 | 2.00x |
 | 1M | 100 | 16.0 | 11.0 | 1.45x |
 | 1M | 1000 | 17.0 | 11.0 | 1.55x |
 
-### 分析
+### Analysis
 
-- **`minmax_lttb` 现在有稳定加速**：1M/n=1000 时 1.55x，1M/n=100 时 1.45x。Phase 1 的 bin-first 优化消除了全量排序，用两次 O(n) 扫描（找 x 范围 + 分桶）替代 O(n log n) 排序。
-- **打乱输入场景加速更显著**：见 7.5 节，1M 打乱数据从 75ms 降到 10ms（**7.5x 加速**），因为打乱输入的排序成本占 88%。
-- **结论**：`minmax_lttb` 现在是未排序大数据集降采样的推荐函数。对于已排序输入，`lttb_sorted`（10ms）和 `minmax_lttb`（11ms）性能接近，`lttb_sorted` 略优因为不需要分桶扫描。
+- **`minmax_lttb` now has a stable speedup**: 1.55x at 1M/n=1000 and 1.45x at 1M/n=100. The Phase 1 bin-first optimization removes the full sort and replaces O(n log n) sorting with two O(n) scans, one to find the x range and one to build bins.
+- **The shuffled-input speedup is larger**: see Section 7.5. A 1M shuffled dataset improves from 75 ms to 10 ms, a **7.5x speedup**, because sorting accounts for 88% of the `lttb` runtime on shuffled input.
+- **Conclusion**: `minmax_lttb` is now the recommended function for large unsorted datasets. For sorted input, `lttb_sorted` at 10 ms and `minmax_lttb` at 11 ms are close, with `lttb_sorted` slightly ahead because it does not need the binning scan.
 
-### 7.4 bucket_stats 性能
+### 7.4 bucket_stats Performance
 
-| 数据量 | 桶数 | 耗时 (ms) |
+| Input Size | Buckets | Time (ms) |
 |---|---|---|
 | 10K | 100 | 1.0 |
 | 10K | 1000 | 1.0 |
@@ -218,30 +218,30 @@
 | 1M | 100 | 16.0 |
 | 1M | 1000 | 15.0 |
 
-### 分析
+### Analysis
 
-- `bucket_stats` 性能与 `lttb` 相当（1M 时 15ms vs 15ms）。虽然不需要三角形面积计算，但排序 + 逐桶统计聚合（min/max/mean/std/first/last）的计算量与 LTTB 相近。
-- 桶数对性能无显著影响——统计聚合是 O(n) 线性扫描，与桶数无关。
+- `bucket_stats` performance is similar to `lttb`, 15 ms vs 15 ms at 1M rows. It avoids triangle-area computation, but sorting plus per-bucket aggregation of min/max/mean/std/first/last has similar cost.
+- The number of buckets has no significant impact on performance because statistical aggregation is an O(n) linear scan, independent of bucket count.
 
-### 7.5 打乱输入（排序成本验证）
+### 7.5 Shuffled Input, Sorting Cost Validation
 
-| 数据量 | n_out | lttb (ms) | lttb_sorted (ms)* | minmax_lttb (ms) | minmax_lttb_sorted (ms) |
+| Input Size | n_out | lttb (ms) | lttb_sorted (ms)* | minmax_lttb (ms) | minmax_lttb_sorted (ms) |
 |---|---|---|---|---|---|
 | 100K shuffled | 1000 | 6.0 | 1.0 | 2.0 | 1.0 |
 | 1M shuffled | 1000 | 75.0 | 9.0 | 10.0 | 13.0 |
 
-> *`lttb_sorted` 对打乱输入会产生错误结果，此处仅展示消除排序后的时间。
+> *`lttb_sorted` returns incorrect results on shuffled input. It is shown here only to isolate the cost of sorting.
 
-### 分析
+### Analysis
 
-- 打乱输入的排序成本显著：1M 时 75ms - 9ms = **66ms**（占总时间 88%）。
-- 对比已排序输入的 7ms 排序成本，打乱输入的排序更贵（`stable_sort` 对无序数据的最坏情况 O(n log²n)）。
-- **`minmax_lttb` 在打乱输入上实现 7.5x 加速**：1M 打乱数据从 75ms（lttb）降到 10ms（minmax_lttb）。bin-first 策略完全跳过全量排序，用两次 O(n) 扫描替代。`minmax_lttb_sorted`（13ms）略慢于 `minmax_lttb`（10ms），因为两者都走 bin-first 路径，差异在测量噪声范围内。
-- **实践建议更新**：对于未排序的大数据集，`minmax_lttb` 是最佳选择（7.5x 加速，结果正确）。对于已排序数据，`lttb_sorted` 仍略优（10ms vs 11ms）。
+- Sorting cost is substantial on shuffled input: at 1M rows, 75 ms - 9 ms = **66 ms**, 88% of total time.
+- Compared with the 7 ms sorting cost on sorted input, shuffled-input sorting is much more expensive because `stable_sort` reaches its worse O(n log^2 n) behavior on unordered data.
+- **`minmax_lttb` achieves a 7.5x speedup on shuffled input**: 1M shuffled rows improve from 75 ms with `lttb` to 10 ms with `minmax_lttb`. The bin-first strategy completely skips the full sort and uses two O(n) scans instead. `minmax_lttb_sorted`, 13 ms, is slightly slower than `minmax_lttb`, 10 ms, but both follow the same bin-first path and the difference is within measurement noise.
+- **Updated practical recommendation**: for large unsorted datasets, `minmax_lttb` is the best choice, with a 7.5x speedup on 1M shuffled rows and correct results. For sorted data, `lttb_sorted` remains slightly faster, 10 ms vs 11 ms.
 
-### 7.6 多组 GROUP BY（100 组，1M 总量）
+### 7.6 Multi-Group GROUP BY, 100 Groups and 1M Total Rows
 
-| 函数 | 耗时 (ms) |
+| Function | Time (ms) |
 |---|---|
 | `lttb` | 11.0 |
 | `lttb_sorted` | 8.0 |
@@ -249,19 +249,19 @@
 | `minmax_lttb(r=4)` | 10.0 |
 | `bucket_stats` | 11.0 |
 
-### 分析
+### Analysis
 
-- 多组场景下 `lttb_sorted` 仍最快（8ms vs 11ms，1.38x 加速）。
-- `minmax_lttb` 在多组场景下略快于 `lttb`（10ms vs 11ms）——每组数据量较小（10K），预选开销更低。
-- 所有函数在多组场景下都比单组 1M 快（11ms vs 15ms），因为每组数据量小、combine 指针转移优化生效。
+- `lttb_sorted` is still fastest in multi-group workloads, 8 ms vs 11 ms, a 1.38x speedup.
+- `minmax_lttb` is slightly faster than `lttb` in multi-group workloads, 10 ms vs 11 ms, because each group is smaller, about 10K rows, and preselection overhead is lower.
+- All functions are faster in the multi-group case than a single 1M-row group, 11 ms vs 15 ms, because each group is smaller and the combine pointer-transfer optimization is effective.
 
-### 7.7 函数选择建议
+### 7.7 Function Selection Guide
 
-| 场景 | 推荐函数 | 理由 |
+| Scenario | Recommended Function | Reason |
 |---|---|---|
-| 已排序输入，一次性降采样 | `lttb_sorted` | 消除排序成本，1.67x 加速 |
-| 未排序输入，一次性降采样 | `minmax_lttb` | bin-first 跳过全量排序，7.5x 加速（打乱 1M） |
-| 未排序输入，需精确结果 | `lttb` | 内部排序，结果正确，但排序成本高 |
-| 已排序输入，接受近似结果 | `minmax_lttb_sorted` | bin-first 快速路径，与 minmax_lttb 性能相当 |
-| 需要选中点索引 | `lttb_indices` | 与 `lttb` 性能相同，输出索引 |
-| 分布分析（非曲线形状） | `bucket_stats` | 提供 min/max/mean/std 统计，适合 AI agent 分析 |
+| Sorted input, one-shot downsampling | `lttb_sorted` | Removes sorting cost, 1.67x speedup |
+| Unsorted input, one-shot downsampling | `minmax_lttb` | Bin-first strategy skips the full sort, 7.5x speedup on 1M shuffled rows |
+| Unsorted input, exact result required | `lttb` | Sorts internally and returns exact LTTB output, but sorting cost is high |
+| Sorted input, approximate result acceptable | `minmax_lttb_sorted` | Bin-first fast path, similar performance to `minmax_lttb` |
+| Selected-point indices required | `lttb_indices` | Same performance as `lttb`, returns selected indices |
+| Distribution analysis rather than curve shape | `bucket_stats` | Provides min/max/mean/std statistics, useful for agent-driven analysis |
